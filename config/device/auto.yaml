@@ -1,0 +1,10 @@
+# @package _global_
+
+device_type: auto
+batch_size: 32
+torch_compile: false
+enable_tf32: false
+amp_dtype: f32
+dataloader:
+  workers: 0
+  pin_memory: false

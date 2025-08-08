@@ -1,0 +1,42 @@
+defaults:
+  - dataset: tiny-imagenet
+  - model: tiny
+  - _self_
+
+rng_seed: 31415
+
+model_name: ${model.name}-${dataset.name}
+n_epochs: 100
+save_every_epoch: 20
+val_every_epoch: 10
+init_from: scratch
+device_type: cuda
+batch_size: 256
+torch_compile: true
+enable_tf32: true
+clip_grad_norm_1: true
+amp_dtype: bf16
+dataloader:
+  workers: 4
+  pin_memory: true
+  drop_last: true
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 6e-4
+  betas: [0.9, 0.99]
+  weight_decay: 0.01
+  eps: 1e-8
+  fused: true
+
+logging:
+  log_dir: ./logs
+  wandb:
+    enable: false
+    project: vit
+
+hydra:
+  job:
+    name: ${model_name}-${now_ist:%d-%m-%y-%H%M%S}
+  run:
+    dir: ${logging.log_dir}/${hydra.job.name}
+  output_subdir: config
