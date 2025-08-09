@@ -1,8 +1,8 @@
-name: "tiny-imagenet"
-img_size: 64
+name: "cifar100"
+img_size: 32
 img_chls: 3
 aug:
   hor_flip_aug: true
   auto_augment: false
   rand_augment: true
-n_class: 200
+n_class: 100

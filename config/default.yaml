@@ -1,6 +1,6 @@
 defaults:
   - dataset: tiny-imagenet
-  - model: tiny
+  - model: ViT-T-8
   - _self_
 
 rng_seed: 31415
@@ -11,22 +11,27 @@ save_every_epoch: 20
 val_every_epoch: 10
 init_from: scratch
 device_type: cuda
-batch_size: 256
 torch_compile: true
 enable_tf32: true
 clip_grad_norm_1: true
-amp_dtype: bf16
+autocast_dtype: bf16
 dataloader:
-  workers: 4
+  batch_size: 256
+  num_workers: 4
   pin_memory: true
   drop_last: true
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 6e-4
+  lr: 3e-4
   betas: [0.9, 0.99]
-  weight_decay: 0.01
+  weight_decay: 0.1
   eps: 1e-8
   fused: true
+lr_scheduler:
+  name: cosine-with-linear-warmup
+  min_lr_pct: 0.1
+  warmup_pct: 0.1
+  decay_step_pct: 0.6
 
 logging:
   log_dir: ./logs
