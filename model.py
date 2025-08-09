@@ -69,7 +69,6 @@ class MultiHeadSelfAttention(nn.Module):
         self.re_qkv = Rearrange("b n (t h d) -> t b h n d", t=3, h=cfg.n_heads, d=head_dim)
         self.re_merge = Rearrange("b h n d -> b n (h d)")
         self.attn_drop = nn.Dropout(cfg.attn_drop_rate)
-        # TODO: Proper init for residual projection layer
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
         self.proj_drop = nn.Dropout(cfg.drop_rate)
 
@@ -105,23 +104,20 @@ class VisionTransformer(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.patch_embed = PatchEmbed(cfg)
-        # TODO: Update to Sinosoidal Posistion Embedding
         self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.n_embd))
         self.pos_embed = nn.Parameter(torch.zeros(1, 1 + cfg.num_patches, cfg.n_embd))
         self.pos_drop = nn.Dropout(cfg.drop_rate)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.norm = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.n_class)
-        self._init_weights()
 
-    # TODO: Check if paper uses this init
-    def _init_weights(self):
+        # Init weights
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
-        self.apply(self._init_vit_weights)
+        self.apply(self._init_weights)
 
     @staticmethod
-    def _init_vit_weights(m):
+    def _init_weights(m):
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:

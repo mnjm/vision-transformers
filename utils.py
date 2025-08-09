@@ -1,11 +1,13 @@
-import torch
-import pytz
+import math
 from datetime import datetime
-from torchvision import datasets
 from pathlib import Path
+import pytz
+import torch
 import torchvision.transforms.v2 as T
 from datasets import load_dataset
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import Dataset
+from torchvision import datasets
 
 def torch_get_device(device_type):
     if device_type == "cuda":
@@ -91,3 +93,28 @@ def get_dataset(cfg):
         train_ds = HFDatasetWrapper(train_ds, transform=transforms)
         val_ds = HFDatasetWrapper(val_ds, transform=transforms)
     return train_ds, val_ds
+
+def cosine_with_linear_warmup_lr_scheduler(optimizer, total_steps, warmup_pct, decay_step_pct, min_lr_pct):
+    """
+    Learning rate scheduler with linear warmup, cosine decay, then constant LR.
+    1. Warmup: LR increases linearly from 0 to LR over (warmup_pct * total_steps)
+    2. Decay: LR follows cosine decay from LR to (min_lr_pct * LR) of it over next (decay_step_pct * total_steps)
+    3. Constant: LR stays at (min_lr_pct * LR) for remaining steps.
+    """
+    warmup_steps = int(warmup_pct * total_steps)
+    decay_steps = warmup_steps + int(decay_step_pct * total_steps)
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            # warmup
+            return float(current_step + 1) / float(max(1, warmup_steps))
+        elif current_step > decay_steps:
+            # constant
+            return min_lr_pct
+        else:
+            # cosine
+            progress = float(current_step - warmup_steps) / float(max(1, decay_steps - warmup_steps))
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_lr_pct + (1 - min_lr_pct) * cosine_decay
+
+    return LambdaLR(optimizer, lr_lambda)

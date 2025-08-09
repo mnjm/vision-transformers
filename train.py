@@ -17,13 +17,14 @@ from utils import (
     torch_compile_ckpt_fix,
     torch_get_device,
     torch_set_seed,
-    get_ist_time_now
+    get_ist_time_now,
+    cosine_with_linear_warmup_lr_scheduler
 )
 OmegaConf.register_new_resolver("now_ist", get_ist_time_now)
 
 @hydra.main(version_base=None, config_path="config", config_name="default")
 def main(cfg):
-    logger = logging.getLogger("vit-train")
+    logger = logging.getLogger("vit")
     device = torch_get_device(cfg.device_type)
     logger.info(f"Using {device}")
     hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
@@ -75,6 +76,17 @@ def main(cfg):
         model = torch.compile(model)
 
     optimizer = hydra.utils.instantiate(cfg.optimizer, params=model.parameters())
+    lr_scheduler = None
+    if cfg.lr_scheduler is not None:
+        if cfg.lr_scheduler.name == "cosine-with-linear-warmup":
+            kwargs = dict(cfg.lr_scheduler)
+            del kwargs['name']
+            lr_scheduler = cosine_with_linear_warmup_lr_scheduler(
+                optimizer=optimizer, total_steps=cfg.n_epochs * len(train_loader), **kwargs
+            )
+        else:
+            raise NotImplementedError(f"{cfg.lr_scheduler.name} is not implemented")
+    grad_clip_max_norm = 1.0 if cfg.clip_grad_norm_1 else float('inf')
 
     if cfg.init_from != 'scratch':
         optimizer.load_state_dict(ckpt['optimizer'])
@@ -102,15 +114,14 @@ def main(cfg):
         for metric in metrics:
             wandb.define_metric(metric, step_metric="epoch")
 
-    norm = float('nan')
     for epoch in range(start_epoch, cfg.n_epochs + 1):
         last_epoch = epoch == cfg.n_epochs
+        logger.info(f"Epoch: {epoch}/{cfg.n_epochs}")
 
         # Train
+        model.train()
         t0 = time()
         loss_cum, correct, total = 0.0, 0, 0
-        model.train()
-        logger.info(f"Epoch: {epoch}/{cfg.n_epochs}")
         progress_bar = tqdm(train_loader, dynamic_ncols=True, desc="Train", leave=False)
         for step, batch in enumerate(progress_bar):
             imgs, lbls = batch[0].to(device), batch[1].to(device)
@@ -119,9 +130,10 @@ def main(cfg):
                 pred = model(imgs)
                 loss = F.cross_entropy(pred, lbls)
             loss.backward()
-            if cfg.clip_grad_norm_1:
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_max_norm)
             optimizer.step()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
             loss_cum += loss.item()
             correct += (pred.argmax(dim=1) == lbls).sum().item()
             total += lbls.size(0)
