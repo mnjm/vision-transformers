@@ -36,7 +36,7 @@ def main(cfg):
 
     model_config = ViTConfig(**cfg.model)
 
-    train_ds, val_ds = get_dataset(cfg.dataset)
+    train_ds, val_ds = get_dataset(cfg)
     logger.info(f"Loading {cfg.dataset.name} dataset")
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=cfg.dataloader.drop_last,
@@ -49,7 +49,7 @@ def main(cfg):
     # import matplotlib.pyplot as plt
     # from torchvision.utils import make_grid
     # imgs, lbls = next(iter(train_loader))
-    # assert imgs.shape[0] > 16
+    # assert imgs.shape[0] >= 16
     # grid_img = make_grid(imgs[:16, ...], 4, normalize=True).to("cpu").permute(1, 2, 0).numpy()
     # plt.title(",".join(str(x) for x in lbls.numpy().reshape(-1)[:16]))
     # plt.imshow(grid_img)

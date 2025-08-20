@@ -56,7 +56,6 @@ class HFDatasetWrapper(Dataset):
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        # Ensure image has 3 channels and is in (H, W, C) format before transforming
         image = item['image'].convert('RGB')
         label = item['label']
 
@@ -65,33 +64,77 @@ class HFDatasetWrapper(Dataset):
 
         return image, torch.tensor(label, dtype=torch.long)
 
+class MixupCutmixWrapper(torch.utils.data.Dataset):
+    def __init__(self, dataset, num_classes, mixup_alpha=0.2, cutmix_alpha=1.0, prob=0.5):
+        self.dataset = dataset
+        self.num_classes = num_classes
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_alpha = cutmix_alpha
+        self.prob = prob
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        img1, label1 = self.dataset[idx]
+        if torch.rand(1).item() > self.prob:
+            return img1, torch.nn.functional.one_hot(torch.tensor(label1), self.num_classes).float()
+        idx2 = torch.randint(0, len(self.dataset), (1,)).item()
+        img2, label2 = self.dataset[idx2]
+
+        if torch.rand(1).item() < 0.5 and self.mixup_alpha > 0: # MixUp
+            lam = torch.distributions.Beta(self.mixup_alpha, self.mixup_alpha).sample().item()
+            img = lam * img1 + (1 - lam) * img2
+            label = lam * torch.nn.functional.one_hot(torch.tensor(label1), self.num_classes).float() \
+                + (1 - lam) * torch.nn.functional.one_hot(torch.tensor(label2), self.num_classes).float()
+        else: # CutMix
+            lam = torch.distributions.Beta(self.cutmix_alpha, self.cutmix_alpha).sample().item()
+            _, H, W = img1.shape
+            cx, cy = torch.randint(W, (1,)).item(), torch.randint(H, (1,)).item()
+            cut_w, cut_h = int(W * (1 - lam) ** 0.5), int(H * (1 - lam) ** 0.5)
+            x1, y1 = max(cx - cut_w // 2, 0), max(cy - cut_h // 2, 0)
+            x2, y2 = min(cx + cut_w // 2, W), min(cy + cut_h // 2, H)
+            img = img1.clone()
+            img[:, y1:y2, x1:x2] = img2[:, y1:y2, x1:x2]
+            lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
+            label = lam * torch.nn.functional.one_hot(torch.tensor(label1), self.num_classes).float() \
+                + (1 - lam) * torch.nn.functional.one_hot(torch.tensor(label2), self.num_classes).float()
+        return img, label
+
 supported_dataset = ["oxford-flowers102", "tiny-imagenet"]
 def get_dataset(cfg):
-    assert cfg.name in supported_dataset, f"{cfg.name} is not supported. Supported datasets: {supported_dataset}"
+    ds_cfg = cfg.dataset
+    assert ds_cfg.name in supported_dataset, f"{ds_cfg.name} is not supported. Supported datasets: {supported_dataset}"
 
-    cache_dir = Path("./dataset") / cfg.name
+    cache_dir = Path("./dataset") / ds_cfg.name
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    resize_to = cfg.aug.center_crop if "center_crop" in cfg.aug else cfg.img_size
-    transforms = [ T.Resize(resize_to) ]
-    if "center_crop" in cfg.aug:
-        transforms.append(T.CenterCrop(cfg.img_size))
-    if cfg.aug.hor_flip_aug:
+    transforms = []
+    if getattr(ds_cfg.aug, 'hor_flip_aug', False):
         transforms.append(T.RandomHorizontalFlip())
-    transforms.extend([
+    if getattr(ds_cfg.aug, "auto_augment", False):
+        transforms.append(T.AutoAugment(T.AutoAugmentPolicy.IMAGENET))
+    if getattr(ds_cfg.aug, "rand_augment", False):
+        transforms.append(T.RandAugment())
+
+    resize = [ T.Resize(ds_cfg.img_size) ]
+    cast_scale = [
         T.ToImage(),
         T.ToDtype(torch.float32, scale=False),
-        T.Normalize(mean=[0.5]*cfg.img_chls, std=[0.5]*cfg.img_chls),
-    ])
-    transforms = T.Compose(transforms)
-    if cfg.name == "oxford-flowers102":
-        train_ds = datasets.ImageFolder(cache_dir / "train", transform=transforms)
-        val_ds = datasets.ImageFolder(cache_dir / "val", transform=transforms)
+        T.Normalize(mean=[0.5]*ds_cfg.img_chls, std=[0.5]*ds_cfg.img_chls),
+    ]
+    train_transforms = T.Compose(resize + transforms + cast_scale)
+    val_transforms = T.Compose(resize + cast_scale)
+    if ds_cfg.name == "oxford-flowers102":
+        train_ds = datasets.ImageFolder(cache_dir / "train", transform=train_transforms)
+        val_ds = datasets.ImageFolder(cache_dir / "val", transform=val_transforms)
     else:
         train_ds = load_dataset('Maysee/tiny-imagenet', split='train', cache_dir=cache_dir)
         val_ds = load_dataset('Maysee/tiny-imagenet', split='valid', cache_dir=cache_dir)
-        train_ds = HFDatasetWrapper(train_ds, transform=transforms)
-        val_ds = HFDatasetWrapper(val_ds, transform=transforms)
+        train_ds = HFDatasetWrapper(train_ds, transform=train_transforms)
+        val_ds = HFDatasetWrapper(val_ds, transform=val_transforms)
+    if getattr(ds_cfg.aug, "mixup_cutmix", False):
+        train_ds = MixupCutmixWrapper(train_ds, num_classes=ds_cfg.dataset.n_class)
     return train_ds, val_ds
 
 def cosine_with_linear_warmup_lr_scheduler(optimizer, total_steps, warmup_pct, decay_step_pct, min_lr_pct):
