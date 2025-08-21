@@ -16,15 +16,18 @@ class ViTConfig:
     n_embd: int = 768
     mlp_dim: int = 3_072
     drop_rate: float = 0.
-    attn_drop_rate: float = 0
+    attn_drop_rate: float = 0.
+    stoch_depth_drop_rate: float = 0.
 
     @property
     def num_patches(self) -> int:
         return (self.img_size // self.patch_size) ** 2
 
 class PatchEmbed(nn.Module):
+
     def __init__(self, cfg: ViTConfig):
         super().__init__()
+        assert cfg.img_size%cfg.patch_size==0
         patch_dim = cfg.patch_size * cfg.patch_size * cfg.img_chls
         self.to_patches = Rearrange(
             "b c (h ph) (w pw) -> b (h w) (c ph pw)",
@@ -40,6 +43,7 @@ class PatchEmbed(nn.Module):
         return x
 
 class MLP(nn.Module):
+
     def __init__(self, cfg: ViTConfig):
         super().__init__()
         self.fc1 = nn.Linear(cfg.n_embd, cfg.mlp_dim)
@@ -56,6 +60,7 @@ class MLP(nn.Module):
         return x
 
 class MultiHeadSelfAttention(nn.Module):
+
     def __init__(self, cfg: ViTConfig):
         super().__init__()
         assert cfg.n_embd % cfg.n_heads == 0
@@ -86,28 +91,52 @@ class MultiHeadSelfAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+class StochDepthDrop(nn.Module):
+    """
+    Stoch. Depth Paper: https://arxiv.org/pdf/1603.09382
+    DeIT uses it: https://arxiv.org/pdf/2012.12877
+    """
+    def __init__(self, drop_prob):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        drop_prob = self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random = torch.rand(shape, dtype=x.dtype, device=x.device)
+        mask = (random > drop_prob).float()
+        out = x * mask / (1. - drop_prob)
+        return out
+
 class Block(nn.Module):
-    def __init__(self, cfg: ViTConfig):
+
+    def __init__(self, cfg: ViTConfig, drop_path_prob: float):
         super().__init__()
         self.norm1 = nn.LayerNorm(cfg.n_embd)
         self.attn = MultiHeadSelfAttention(cfg)
         self.norm2 = nn.LayerNorm(cfg.n_embd)
         self.mlp = MLP(cfg)
+        self.drop_path_attn = StochDepthDrop(drop_path_prob)
+        self.drop_path_mlp = StochDepthDrop(drop_path_prob)
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x)) # residual
-        x = x + self.mlp(self.norm2(x)) # residual
+        x = x + self.drop_path_attn(self.attn(self.norm1(x))) # residual with stocastic drop path regularizer
+        x = x + self.drop_path_mlp(self.mlp(self.norm2(x))) # residual with stocastic drop path regularizer
         return x
 
 class VisionTransformer(nn.Module):
+
     def __init__(self, cfg: ViTConfig):
         super().__init__()
         self.cfg = cfg
+        L = cfg.n_layer
         self.patch_embed = PatchEmbed(cfg)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.n_embd))
         self.pos_embed = nn.Parameter(torch.zeros(1, 1 + cfg.num_patches, cfg.n_embd))
         self.pos_drop = nn.Dropout(cfg.drop_rate)
-        self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
+        self.blocks = nn.ModuleList(Block(cfg, (l+1) / L * cfg.stoch_depth_drop_rate) for l in range(L))  # noqa: E741
         self.norm = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.n_class)
 

@@ -65,6 +65,7 @@ class HFDatasetWrapper(Dataset):
         return image, torch.tensor(label, dtype=torch.long)
 
 class MixupCutmixWrapper(torch.utils.data.Dataset):
+
     def __init__(self, dataset, num_classes, mixup_alpha=0.2, cutmix_alpha=1.0, prob=0.5):
         self.dataset = dataset
         self.num_classes = num_classes
@@ -161,3 +162,34 @@ def cosine_with_linear_warmup_lr_scheduler(optimizer, total_steps, warmup_pct, d
         return min_lr_pct + (1 - min_lr_pct) * cosine_decay
 
     return LambdaLR(optimizer, lr_lambda)
+
+@torch.no_grad()
+def calc_accuracy(output, target, topk=(1,)):
+    """ Computes the accuracy over the k top predictions for the specified values of k. """
+    maxk = max(topk)
+    batch_size = target.size(0)
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+    res = []
+    for k in topk:
+        correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+class AverageMetric:
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count if self.count > 0 else 0

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import wandb
 from dotenv import load_dotenv
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from model import ViTConfig, VisionTransformer
 from utils import (
     get_dataset,
@@ -18,7 +18,9 @@ from utils import (
     torch_get_device,
     torch_set_seed,
     get_ist_time_now,
-    cosine_with_linear_warmup_lr_scheduler
+    cosine_with_linear_warmup_lr_scheduler,
+    AverageMetric,
+    calc_accuracy,
 )
 OmegaConf.register_new_resolver("now_ist", get_ist_time_now)
 
@@ -30,7 +32,7 @@ def main(cfg):
     hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
     log_dir = Path(hydra_cfg.runtime.output_dir)
     run_name = hydra_cfg.job.name
-    torch_amp_dtype = {'f32': torch.float32, 'bf16': torch.bfloat16}[cfg.amp_dtype]
+    torch_autocast_dtype = {'f32': torch.float32, 'bf16': torch.bfloat16}[cfg.autocast_dtype]
 
     torch_set_seed(cfg.rng_seed)
 
@@ -86,16 +88,16 @@ def main(cfg):
             )
         else:
             raise NotImplementedError(f"{cfg.lr_scheduler.name} is not implemented")
-    grad_clip_max_norm = 1.0 if cfg.clip_grad_norm_1 else float('inf')
 
     if cfg.init_from != 'scratch':
         optimizer.load_state_dict(ckpt['optimizer'])
 
     if cfg.enable_tf32:
         torch.set_float32_matmul_precision("high")
-    amp_ctx = (
-        torch.amp.autocast(device_type=device.type, dtype=torch_amp_dtype)
-        if device.type == "cuda" and torch_amp_dtype == torch.bfloat16
+        torch.backends.cuda.matmul.allow_tf32 = True
+    autocast_ctx = (
+        torch.amp.autocast(device_type=device.type, dtype=torch_autocast_dtype)
+        if device.type == "cuda" and torch_autocast_dtype == torch.bfloat16
         else nullcontext()
     )
 
@@ -109,7 +111,7 @@ def main(cfg):
           name=run_name,
           config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
         )
-        metrics = 'train/loss', 'train/acc', 'val/loss', 'val/acc', 'train/time', 'val/time'
+        metrics = 'train/loss', 'train/acc@1', 'train/acc@5', 'val/loss', 'val/acc@1', 'val/acc@5', 'train/time', 'val/time'
         wandb.define_metric("epoch")
         for metric in metrics:
             wandb.define_metric(metric, step_metric="epoch")
@@ -121,65 +123,75 @@ def main(cfg):
         # Train
         model.train()
         t0 = time()
-        loss_cum, correct, total = 0.0, 0, 0
+        loss, acc1, acc5 = AverageMetric(), AverageMetric(), AverageMetric()
         progress_bar = tqdm(train_loader, dynamic_ncols=True, desc="Train", leave=False)
         for step, batch in enumerate(progress_bar):
             imgs, lbls = batch[0].to(device), batch[1].to(device)
             optimizer.zero_grad()
-            with amp_ctx:
+            with autocast_ctx:
                 pred = model(imgs)
-                loss = F.cross_entropy(pred, lbls)
-            loss.backward()
-            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_max_norm)
+                loss_i = F.cross_entropy(pred, lbls)
+            loss_i.backward()
+            if cfg.clip_grad_norm_1:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.)
             optimizer.step()
             if lr_scheduler is not None:
                 lr_scheduler.step()
-            loss_cum += loss.item()
-            correct += (pred.argmax(dim=1) == lbls).sum().item()
-            total += lbls.size(0)
-            progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+            acc1_i, acc5_i = calc_accuracy(pred, lbls, (1, 5))
+            batch_size = lbls.size(0)
+            loss.update(loss_i.item(), batch_size)
+            acc1.update(acc1_i.item(), batch_size)
+            acc5.update(acc5_i.item(), batch_size)
+            progress_bar.set_postfix({
+                'loss': f"{loss_i.item():.4f}",
+                'acc@1': f"{acc1_i.item():.2%}",
+                'acc@5': f"{acc5_i.item():.2%}",
+            })
         if device.type == "cuda":
             torch.cuda.synchronize()
         t = time() - t0
-        avg_loss = loss_cum / len(train_loader)
-        acc = correct / total
-        logger.info(f"Loss: {avg_loss:.4f} Acc: {acc:.2%} Norm: {norm: .4f} Time: {t:.2f}s")
+        logger.info(f"Loss: {loss.avg:.4f} Acc@1: {acc1.avg:.2%} Acc@5: {acc5.avg:.2%} Time: {t:.2f}s")
         if cfg.logging.wandb.enable:
             wandb.log({
                 'epoch': epoch,
-                'train/loss': avg_loss,
-                'train/acc': acc,
+                'train/loss': loss.avg,
+                'train/acc@1': acc1.avg,
+                'train/acc@5': acc5.avg,
                 'train/time': t,
             })
 
         # Val
-        if last_epoch or epoch % cfg.val_every_epoch == 0:
+        if epoch == start_epoch or last_epoch or epoch % cfg.val_every_epoch == 0:
             progress_bar = tqdm(val_loader, dynamic_ncols=True, desc="Val", leave=False)
             model.eval()
             t0 = time()
-            loss_cum, correct, total = 0.0, 0, 0
+            loss, acc1, acc5 = AverageMetric(), AverageMetric(), AverageMetric()
             with torch.no_grad():
-                correct, total = 0, 0
                 for step, batch in enumerate(progress_bar):
                     imgs, lbls = batch[0].to(device), batch[1].to(device)
-                    with amp_ctx:
+                    with autocast_ctx:
                         pred = model(imgs)
-                        loss = F.cross_entropy(pred, lbls)
-                        correct += (pred.argmax(dim=1) == lbls).sum().item()
-                        total += lbls.size(0)
-                    loss_cum += loss.item()
-                    progress_bar.set_postfix({'loss': f"{loss.item():.4f}"})
+                        loss_i = F.cross_entropy(pred, lbls)
+                    acc1_i, acc5_i = calc_accuracy(pred, lbls, (1, 5))
+                    batch_size = lbls.size(0)
+                    loss.update(loss_i.item(), batch_size)
+                    acc1.update(acc1_i.item(), batch_size)
+                    acc5.update(acc5_i.item(), batch_size)
+                    progress_bar.set_postfix({
+                        'loss': f"{loss_i.item():.4f}",
+                        'acc@1': f"{acc1_i.item():.2%}",
+                        'acc@5': f"{acc5_i.item():.2%}",
+                    })
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t = time() - t0
-            avg_loss = loss_cum / len(val_loader)
-            acc = correct / total
-            logger.info(f"Val Loss: {avg_loss:.4f} Acc: {acc:.2%} Time: {t:.2f}s")
+            logger.info(f"Loss: {loss.avg:.4f} Acc@1: {acc1.avg:.2%} Acc@5: {acc5.avg:.2%} Time: {t:.2f}s")
             if cfg.logging.wandb.enable:
                 wandb.log({
                     'epoch': epoch,
-                    'val/loss': avg_loss,
-                    'val/acc': acc,
+                    'val/loss': loss.avg,
+                    'val/acc@1': acc1.avg,
+                    'val/acc@5': acc5.avg,
                     'val/time': t,
                 })
 
@@ -190,7 +202,6 @@ def main(cfg):
                 'model': model.state_dict(),
                 'config': cfg,
                 'epoch': epoch,
-                'loss': avg_loss,
                 'optimizer': optimizer.state_dict(),
             }, ckpt_path)
             logger.info(f"Saved checkpoint to {str(ckpt_path)}")

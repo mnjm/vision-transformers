@@ -15,7 +15,7 @@ batch_size: 256
 torch_compile: true
 enable_tf32: true
 clip_grad_norm_1: true
-amp_dtype: bf16
+autocast_dtype: bf16
 dataloader:
   workers: 4
   pin_memory: true
