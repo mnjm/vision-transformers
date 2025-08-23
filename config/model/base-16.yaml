@@ -1,4 +1,4 @@
-name: base
+name: base-16
 img_size: ${dataset.img_size} # resolution (H=W)
 patch_size: 16                  # 16x16 patchees
 img_chls: ${dataset.img_chls}

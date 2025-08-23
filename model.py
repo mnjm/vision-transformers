@@ -66,21 +66,23 @@ class MultiHeadSelfAttention(nn.Module):
         assert cfg.n_embd % cfg.n_heads == 0
         self.n_heads = cfg.n_heads
         head_dim = cfg.n_embd // cfg.n_heads
-        self.scale = head_dim ** -0.5
         self.flash_attn = hasattr(F, 'scaled_dot_product_attention')
-        if not self.flash_attn:
+        if self.flash_attn:
+            self.attn_drop_rate = cfg.attn_drop_rate
+        else:
             print("WARNING: Using slow attention. Flash attention is only supported in Pytorch >= 2.0")
+            self.scale = head_dim ** -0.5
+            self.attn_drop = nn.Dropout(cfg.attn_drop_rate)
         self.qkv = nn.Linear(cfg.n_embd, cfg.n_embd * 3)
         self.re_qkv = Rearrange("b n (t h d) -> t b h n d", t=3, h=cfg.n_heads, d=head_dim)
         self.re_merge = Rearrange("b h n d -> b n (h d)")
-        self.attn_drop = nn.Dropout(cfg.attn_drop_rate)
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
         self.proj_drop = nn.Dropout(cfg.drop_rate)
 
     def forward(self, x):
         q, k, v = self.re_qkv(self.qkv(x))
         if self.flash_attn:
-            x = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            x = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=self.attn_drop_rate)
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
@@ -101,9 +103,9 @@ class StochDepthDrop(nn.Module):
         self.drop_prob = drop_prob
 
     def forward(self, x):
-        if self.drop_prob == 0. or not self.training:
-            return x
         drop_prob = self.drop_prob
+        if drop_prob == 0. or not self.training:
+            return x
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         random = torch.rand(shape, dtype=x.dtype, device=x.device)
         mask = (random > drop_prob).float()

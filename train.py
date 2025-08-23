@@ -40,14 +40,10 @@ def main(cfg):
 
     train_ds, val_ds = get_dataset(cfg)
     logger.info(f"Loading {cfg.dataset.name} dataset")
-    train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=cfg.dataloader.drop_last,
-        pin_memory=cfg.dataloader.pin_memory, num_workers=cfg.dataloader.workers
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
-        drop_last=False, num_workers=cfg.dataloader.workers
-    )
+    kwargs = dict(cfg.dataloader)
+    train_loader = DataLoader(train_ds, shuffle=True, **kwargs)
+    kwargs['drop_last'] = False
+    val_loader = DataLoader(val_ds, shuffle=False, **kwargs)
     # import matplotlib.pyplot as plt
     # from torchvision.utils import make_grid
     # imgs, lbls = next(iter(train_loader))
@@ -150,7 +146,7 @@ def main(cfg):
         if device.type == "cuda":
             torch.cuda.synchronize()
         t = time() - t0
-        logger.info(f"Loss: {loss.avg:.4f} Acc@1: {acc1.avg:.2%} Acc@5: {acc5.avg:.2%} Time: {t:.2f}s")
+        logger.info(f"{'Train':<5} Loss: {loss.avg:.4f} Acc@1: {acc1.avg:.2%} Acc@5: {acc5.avg:.2%} Time: {t:.2f}s")
         if cfg.logging.wandb.enable:
             wandb.log({
                 'epoch': epoch,
@@ -159,6 +155,7 @@ def main(cfg):
                 'train/acc@5': acc5.avg,
                 'train/time': t,
             })
+        progress_bar.close()
 
         # Val
         if epoch == start_epoch or last_epoch or epoch % cfg.val_every_epoch == 0:
@@ -185,7 +182,7 @@ def main(cfg):
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t = time() - t0
-            logger.info(f"Loss: {loss.avg:.4f} Acc@1: {acc1.avg:.2%} Acc@5: {acc5.avg:.2%} Time: {t:.2f}s")
+            logger.info(f"{'Val':<5} Loss: {loss.avg:.4f} Acc@1: {acc1.avg:.2%} Acc@5: {acc5.avg:.2%} Time: {t:.2f}s")
             if cfg.logging.wandb.enable:
                 wandb.log({
                     'epoch': epoch,
@@ -194,6 +191,7 @@ def main(cfg):
                     'val/acc@5': acc5.avg,
                     'val/time': t,
                 })
+            progress_bar.close()
 
         # Ckpt
         if last_epoch or epoch % cfg.save_every_epoch == 0:
