@@ -33,13 +33,11 @@ class PatchEmbed(nn.Module):
             "b c (h ph) (w pw) -> b (h w) (c ph pw)",
             ph=cfg.patch_size, pw=cfg.patch_size
         )  # (B, num_patches, patch_dim)
-        self.proj = nn.Linear(patch_dim, cfg.n_embd, bias=False)
-        self.norm = nn.LayerNorm(cfg.n_embd)
+        self.proj = nn.Linear(patch_dim, cfg.n_embd, bias=True)
 
     def forward(self, x):
         x = self.to_patches(x)
         x = self.proj(x)
-        x = self.norm(x)
         return x
 
 class MLP(nn.Module):

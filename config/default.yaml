@@ -1,6 +1,6 @@
 defaults:
   - dataset: tiny-imagenet
-  - model: tiny-8
+  - model: ViT-T-8
   - _self_
 
 rng_seed: 31415
