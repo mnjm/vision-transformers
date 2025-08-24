@@ -6,7 +6,7 @@ from einops.layers.torch import Rearrange
 
 @dataclass
 class ViTConfig:
-    name: str = "base"
+    name: str = "ViT-B-16"
     img_size: int = 224
     patch_size: int = 16
     img_chls: int = 3
@@ -171,9 +171,41 @@ class VisionTransformer(nn.Module):
         return self.head(cls_out) # (B,num_classes)
 
 if __name__ == "__main__":
+    from torchvision import models
+    from omegaconf import OmegaConf
+    from pathlib import Path
+
+    # Test output shape
     cfg = ViTConfig()
     model = VisionTransformer(cfg)
-    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
     dummy = torch.randn(2, 3, cfg.img_size, cfg.img_size)
     out = model(dummy)
-    print(out.shape)
+    assert out.shape == (2, 1000), f"Output mismatch {out.shape}"
+
+    # Test all available vit models from `torchvision.models`
+    model_map = {
+        'ViT-B-16': models.vit_b_16,
+        'ViT-B-32': models.vit_b_32,
+        'ViT-L-16': models.vit_l_16,
+        'ViT-L-32': models.vit_l_32,
+        'ViT-H-14': models.vit_h_14,
+    }
+    yml_files = Path("./config/model").glob("*.yaml")
+    for yml_file in yml_files:
+        cfg = OmegaConf.load(yml_file)
+        cfg.img_size = 224
+        cfg.img_chls = 3
+        cfg.n_class = 1000
+        name = cfg.name
+        kwargs = dict(cfg)
+        if name not in model_map:
+            continue
+        pt_model = model_map[name]()
+        pt_params = sum(p.numel() for p in pt_model.parameters())
+        model = VisionTransformer(ViTConfig(**kwargs))
+        my_params = sum(p.numel() for p in model.parameters())
+        print(f"{name=} {pt_params=:,} {my_params=:,}")
+        assert pt_params == my_params, f"{name} failed"
+    print("\n" + "="*20)
+    print("Success!")
+    print("="*20 + "\n")
