@@ -3,4 +3,7 @@ img_size: 64
 img_chls: 3
 aug:
   hor_flip_aug: true
+  auto_augment: true
+  rand_augment: true
+  mixup_cutmix: false # BUG: classes are getting collapsed to single class
 n_class: 200

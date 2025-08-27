@@ -78,17 +78,20 @@ class MixupCutmixWrapper(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         img1, label1 = self.dataset[idx]
+        if not isinstance(label1, torch.Tensor):
+            label1 = torch.tensor(label1, dtype=torch.long)
         if torch.rand(1).item() > self.prob:
-            return img1, torch.nn.functional.one_hot(torch.tensor(label1), self.num_classes).float()
+            return img1, torch.nn.functional.one_hot(label1, self.num_classes).float()
         idx2 = torch.randint(0, len(self.dataset), (1,)).item()
         img2, label2 = self.dataset[idx2]
-
-        if torch.rand(1).item() < 0.5 and self.mixup_alpha > 0: # MixUp
+        if not isinstance(label2, torch.Tensor):
+            label2 = torch.tensor(label2, dtype=torch.long)
+        if torch.rand(1).item() < 0.5 and self.mixup_alpha > 0:  # MixUp
             lam = torch.distributions.Beta(self.mixup_alpha, self.mixup_alpha).sample().item()
             img = lam * img1 + (1 - lam) * img2
-            label = lam * torch.nn.functional.one_hot(torch.tensor(label1), self.num_classes).float() \
-                + (1 - lam) * torch.nn.functional.one_hot(torch.tensor(label2), self.num_classes).float()
-        else: # CutMix
+            label = lam * torch.nn.functional.one_hot(label1, self.num_classes).float() \
+                + (1 - lam) * torch.nn.functional.one_hot(label2, self.num_classes).float()
+        else:  # CutMix
             lam = torch.distributions.Beta(self.cutmix_alpha, self.cutmix_alpha).sample().item()
             _, H, W = img1.shape
             cx, cy = torch.randint(W, (1,)).item(), torch.randint(H, (1,)).item()
@@ -98,8 +101,8 @@ class MixupCutmixWrapper(torch.utils.data.Dataset):
             img = img1.clone()
             img[:, y1:y2, x1:x2] = img2[:, y1:y2, x1:x2]
             lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
-            label = lam * torch.nn.functional.one_hot(torch.tensor(label1), self.num_classes).float() \
-                + (1 - lam) * torch.nn.functional.one_hot(torch.tensor(label2), self.num_classes).float()
+            label = lam * torch.nn.functional.one_hot(label1, self.num_classes).float() \
+                + (1 - lam) * torch.nn.functional.one_hot(label2, self.num_classes).float()
         return img, label
 
 supported_dataset = ["oxford-flowers102", "tiny-imagenet"]
@@ -135,7 +138,7 @@ def get_dataset(cfg):
         train_ds = HFDatasetWrapper(train_ds, transform=train_transforms)
         val_ds = HFDatasetWrapper(val_ds, transform=val_transforms)
     if getattr(ds_cfg.aug, "mixup_cutmix", False):
-        train_ds = MixupCutmixWrapper(train_ds, num_classes=ds_cfg.dataset.n_class)
+        train_ds = MixupCutmixWrapper(train_ds, num_classes=ds_cfg.n_class)
     return train_ds, val_ds
 
 def cosine_with_linear_warmup_lr_scheduler(optimizer, total_steps, warmup_pct, decay_step_pct, min_lr_pct):

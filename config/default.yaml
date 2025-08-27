@@ -22,7 +22,7 @@ dataloader:
   drop_last: true
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 6e-4
+  lr: 3e-4
   betas: [0.9, 0.99]
   weight_decay: 0.1
   eps: 1e-8
@@ -32,12 +32,6 @@ lr_scheduler:
   min_lr_pct: 0.1
   warmup_pct: 0.1
   decay_step_pct: 0.6
-
-aug:
-  hor_flip_aug: true
-  augo_augment: true
-  rand_arugment: true
-  mixup_cutmix: true
 
 logging:
   log_dir: ./logs
