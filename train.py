@@ -24,6 +24,23 @@ from utils import (
 )
 OmegaConf.register_new_resolver("now_ist", get_ist_time_now)
 
+def configure_optimizer(optim_cfg, model, device):
+    optim_cfg.fused = getattr(optim_cfg, 'fused', False) and device.type == "cuda"
+    params_dict = { pn: p for pn, p in model.named_parameters() }
+    params_dict = { pn:p for pn, p in params_dict.items() if p.requires_grad } # filter params that requires grad
+    # create optim groups of any params that is 2D or more. This group will be weight decayed ie weight tensors in Linar and embeddings
+    decay_params = [ p for p in params_dict.values() if p.dim() >= 2]
+    # create optim groups of any params that is 1D. All biases and layernorm params
+    no_decay_params = [ p for p in params_dict.values() if p.dim() < 2]
+    weight_decay = getattr(optim_cfg, 'weight_decay', 0.0)
+    optim_cfg.weight_decay = 0.
+    optim_groups = [
+        { 'params': decay_params, 'weight_decay': weight_decay },
+        { 'params': no_decay_params, 'weight_decay': 0.0 },
+    ]
+    optimizer = hydra.utils.instantiate(optim_cfg, params=optim_groups, _convert_="all")
+    return optimizer
+
 @hydra.main(version_base=None, config_path="config", config_name="default")
 def main(cfg):
     logger = logging.getLogger("vit")
@@ -73,7 +90,8 @@ def main(cfg):
     if cfg.torch_compile:
         model = torch.compile(model)
 
-    optimizer = hydra.utils.instantiate(cfg.optimizer, params=model.parameters())
+    # optimizer
+    optimizer = configure_optimizer(cfg.optimizer, model, device)
     lr_scheduler = None
     if cfg.lr_scheduler is not None:
         if cfg.lr_scheduler.name == "cosine-with-linear-warmup":
@@ -87,6 +105,9 @@ def main(cfg):
 
     if cfg.init_from != 'scratch':
         optimizer.load_state_dict(ckpt['optimizer'])
+        lr_schdlr_state = ckpt.get('lr_scheduler', None)
+        if lr_schdlr_state and lr_scheduler:
+            lr_scheduler.load_state_dict(lr_schdlr_state)
 
     if cfg.enable_tf32:
         torch.set_float32_matmul_precision("high")
@@ -201,6 +222,7 @@ def main(cfg):
                 'config': cfg,
                 'epoch': epoch,
                 'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict() if lr_scheduler is not None else None,
             }, ckpt_path)
             logger.info(f"Saved checkpoint to {str(ckpt_path)}")
 

@@ -40,8 +40,8 @@ def torch_compile_ckpt_fix(state_dict):
     return state_dict
 
 def get_ist_time_now(fmt="%d-%m-%Y-%H%M%S"):
-    ist = pytz.timezone('Asia/Kolkata')
-    now_ist = datetime.now(ist)
+    tz = pytz.timezone('Asia/Kolkata')
+    now_ist = datetime.now(tz)
     return now_ist.strftime(fmt)
 
 class HFDatasetWrapper(Dataset):
@@ -64,47 +64,6 @@ class HFDatasetWrapper(Dataset):
 
         return image, torch.tensor(label, dtype=torch.long)
 
-class MixupCutmixWrapper(torch.utils.data.Dataset):
-
-    def __init__(self, dataset, num_classes, mixup_alpha=0.2, cutmix_alpha=1.0, prob=0.5):
-        self.dataset = dataset
-        self.num_classes = num_classes
-        self.mixup_alpha = mixup_alpha
-        self.cutmix_alpha = cutmix_alpha
-        self.prob = prob
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        img1, label1 = self.dataset[idx]
-        if not isinstance(label1, torch.Tensor):
-            label1 = torch.tensor(label1, dtype=torch.long)
-        if torch.rand(1).item() > self.prob:
-            return img1, torch.nn.functional.one_hot(label1, self.num_classes).float()
-        idx2 = torch.randint(0, len(self.dataset), (1,)).item()
-        img2, label2 = self.dataset[idx2]
-        if not isinstance(label2, torch.Tensor):
-            label2 = torch.tensor(label2, dtype=torch.long)
-        if torch.rand(1).item() < 0.5 and self.mixup_alpha > 0:  # MixUp
-            lam = torch.distributions.Beta(self.mixup_alpha, self.mixup_alpha).sample().item()
-            img = lam * img1 + (1 - lam) * img2
-            label = lam * torch.nn.functional.one_hot(label1, self.num_classes).float() \
-                + (1 - lam) * torch.nn.functional.one_hot(label2, self.num_classes).float()
-        else:  # CutMix
-            lam = torch.distributions.Beta(self.cutmix_alpha, self.cutmix_alpha).sample().item()
-            _, H, W = img1.shape
-            cx, cy = torch.randint(W, (1,)).item(), torch.randint(H, (1,)).item()
-            cut_w, cut_h = int(W * (1 - lam) ** 0.5), int(H * (1 - lam) ** 0.5)
-            x1, y1 = max(cx - cut_w // 2, 0), max(cy - cut_h // 2, 0)
-            x2, y2 = min(cx + cut_w // 2, W), min(cy + cut_h // 2, H)
-            img = img1.clone()
-            img[:, y1:y2, x1:x2] = img2[:, y1:y2, x1:x2]
-            lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
-            label = lam * torch.nn.functional.one_hot(label1, self.num_classes).float() \
-                + (1 - lam) * torch.nn.functional.one_hot(label2, self.num_classes).float()
-        return img, label
-
 supported_dataset = ["oxford-flowers102", "tiny-imagenet"]
 def get_dataset(cfg):
     ds_cfg = cfg.dataset
@@ -116,10 +75,11 @@ def get_dataset(cfg):
     transforms = []
     if getattr(ds_cfg.aug, 'hor_flip_aug', False):
         transforms.append(T.RandomHorizontalFlip())
-    if getattr(ds_cfg.aug, "auto_augment", False):
-        transforms.append(T.AutoAugment(T.AutoAugmentPolicy.IMAGENET))
     if getattr(ds_cfg.aug, "rand_augment", False):
         transforms.append(T.RandAugment())
+    # prefer rand augment if both rand augment and auto augment is enabled
+    elif getattr(ds_cfg.aug, "auto_augment", False):
+        transforms.append(T.AutoAugment(T.AutoAugmentPolicy.IMAGENET))
 
     resize = [ T.Resize(ds_cfg.img_size) ]
     cast_scale = [
@@ -137,8 +97,6 @@ def get_dataset(cfg):
         val_ds = load_dataset('Maysee/tiny-imagenet', split='valid', cache_dir=cache_dir)
         train_ds = HFDatasetWrapper(train_ds, transform=train_transforms)
         val_ds = HFDatasetWrapper(val_ds, transform=val_transforms)
-    if getattr(ds_cfg.aug, "mixup_cutmix", False):
-        train_ds = MixupCutmixWrapper(train_ds, num_classes=ds_cfg.n_class)
     return train_ds, val_ds
 
 def cosine_with_linear_warmup_lr_scheduler(optimizer, total_steps, warmup_pct, decay_step_pct, min_lr_pct):
