@@ -59,16 +59,15 @@ class MLP(nn.Module):
 
 class MultiHeadSelfAttention(nn.Module):
 
-    def __init__(self, cfg: ViTConfig):
+    def __init__(self, cfg: ViTConfig, enable_flash_attn=True):
         super().__init__()
         assert cfg.n_embd % cfg.n_heads == 0
         self.n_heads = cfg.n_heads
         head_dim = cfg.n_embd // cfg.n_heads
-        self.flash_attn = hasattr(F, 'scaled_dot_product_attention')
+        self.flash_attn = enable_flash_attn and hasattr(F, 'scaled_dot_product_attention')
         if self.flash_attn:
             self.attn_drop_rate = cfg.attn_drop_rate
         else:
-            print("WARNING: Using slow attention. Flash attention is only supported in Pytorch >= 2.0")
             self.scale = head_dim ** -0.5
             self.attn_drop = nn.Dropout(cfg.attn_drop_rate)
         self.qkv = nn.Linear(cfg.n_embd, cfg.n_embd * 3)
@@ -112,7 +111,7 @@ class StochDepthDrop(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, cfg: ViTConfig, drop_path_prob: float):
+    def __init__(self, cfg: ViTConfig, drop_path_prob: float, enable_flash_attn=True):
         super().__init__()
         self.norm1 = nn.LayerNorm(cfg.n_embd)
         self.attn = MultiHeadSelfAttention(cfg)
@@ -128,7 +127,7 @@ class Block(nn.Module):
 
 class VisionTransformer(nn.Module):
 
-    def __init__(self, cfg: ViTConfig):
+    def __init__(self, cfg: ViTConfig, enable_flash_attn=True):
         super().__init__()
         self.cfg = cfg
         L = cfg.n_layer
@@ -136,7 +135,14 @@ class VisionTransformer(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.n_embd))
         self.pos_embed = nn.Parameter(torch.zeros(1, 1 + cfg.num_patches, cfg.n_embd))
         self.pos_drop = nn.Dropout(cfg.drop_rate)
-        self.blocks = nn.ModuleList(Block(cfg, (l+1) / L * cfg.stoch_depth_drop_rate) for l in range(L))  # noqa: E741
+        self.blocks = nn.ModuleList(
+            Block(
+                cfg,
+                (l + 1) / L * cfg.stoch_depth_drop_rate,
+                enable_flash_attn=enable_flash_attn,
+            )
+            for l in range(L) # noqa: E741
+        )
         self.norm = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.n_class)
 
@@ -175,11 +181,10 @@ if __name__ == "__main__":
     from omegaconf import OmegaConf
     from pathlib import Path
 
-    # Test output shape
     cfg = ViTConfig()
-    model = VisionTransformer(cfg)
+    my_model = VisionTransformer(cfg)
     dummy = torch.randn(2, 3, cfg.img_size, cfg.img_size)
-    out = model(dummy)
+    out = my_model(dummy)
     assert out.shape == (2, 1000), f"Output mismatch {out.shape}"
 
     # Test all available vit models from `torchvision.models`
@@ -202,10 +207,10 @@ if __name__ == "__main__":
             continue
         pt_model = model_map[name]()
         pt_params = sum(p.numel() for p in pt_model.parameters())
-        model = VisionTransformer(ViTConfig(**kwargs))
-        my_params = sum(p.numel() for p in model.parameters())
-        print(f"{name=} {pt_params=:,} {my_params=:,}")
-        assert pt_params == my_params, f"{name} failed"
-    print("\n" + "="*20)
-    print("Success!")
-    print("="*20 + "\n")
+        my_model = VisionTransformer(ViTConfig(**kwargs))
+        my_params = sum(p.numel() for p in my_model.parameters())
+        assert pt_params == my_params, f"{name} params mismatch {pt_params=} {my_params=}"
+
+    print("="*20)
+    print("Success")
+    print("="*20)
