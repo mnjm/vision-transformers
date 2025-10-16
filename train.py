@@ -84,7 +84,7 @@ def main(cfg):
         model.to(device)
         model.load_state_dict(torch_compile_ckpt_fix(ckpt['model']))
         logger.info(f"Loaded checkpoint from {cfg.init_from}")
-        start_epoch = ckpt['epoch']
+        start_epoch = ckpt['epoch'] + 1
 
     logger.info(f"Model type: {model_config.name} params: {sum(p.numel() for p in model.parameters()):,}")
     if cfg.torch_compile:
@@ -133,18 +133,15 @@ def main(cfg):
         for metric in metrics:
             wandb.define_metric(metric, step_metric="epoch")
 
-    for epoch in range(start_epoch, cfg.n_epochs + 1):
-        last_epoch = epoch == cfg.n_epochs
-        logger.info(f"Epoch: {epoch}/{cfg.n_epochs}")
-
-        # Train
+    def train_epoch():
         model.train()
         t0 = time()
         loss, acc1, acc5 = AverageMetric(), AverageMetric(), AverageMetric()
         progress_bar = tqdm(train_loader, dynamic_ncols=True, desc="Train", leave=False)
         for step, batch in enumerate(progress_bar):
             imgs, lbls = batch[0].to(device), batch[1].to(device)
-            optimizer.zero_grad()
+
+            optimizer.zero_grad(set_to_none=True)
             with autocast_ctx:
                 pred = model(imgs)
                 loss_i = F.cross_entropy(pred, lbls)
@@ -154,6 +151,7 @@ def main(cfg):
             optimizer.step()
             if lr_scheduler is not None:
                 lr_scheduler.step()
+
             acc1_i, acc5_i = calc_accuracy(pred, lbls, (1, 5))
             batch_size = lbls.size(0)
             loss.update(loss_i.item(), batch_size)
@@ -164,55 +162,73 @@ def main(cfg):
                 'acc@1': f"{acc1_i.item():.2%}",
                 'acc@5': f"{acc5_i.item():.2%}",
             })
+
+        progress_bar.close()
         if device.type == "cuda":
             torch.cuda.synchronize()
         t = time() - t0
-        logger.info(f"{'Train':<5} Loss: {loss.avg:.4f} Acc@1: {acc1.avg:.2%} Acc@5: {acc5.avg:.2%} Time: {t:.2f}s")
+        return loss.avg, acc1.avg, acc5.avg, t
+
+    @torch.no_grad()
+    def val_epoch():
+        progress_bar = tqdm(val_loader, dynamic_ncols=True, desc="Val", leave=False)
+        model.eval()
+        t0 = time()
+        loss, acc1, acc5 = AverageMetric(), AverageMetric(), AverageMetric()
+        for step, batch in enumerate(progress_bar):
+            imgs, lbls = batch[0].to(device), batch[1].to(device)
+
+            with autocast_ctx:
+                pred = model(imgs)
+                loss_i = F.cross_entropy(pred, lbls)
+
+            acc1_i, acc5_i = calc_accuracy(pred, lbls, (1, 5))
+            batch_size = lbls.size(0)
+            loss.update(loss_i.item(), batch_size)
+            acc1.update(acc1_i.item(), batch_size)
+            acc5.update(acc5_i.item(), batch_size)
+            progress_bar.set_postfix({
+                'loss': f"{loss_i.item():.4f}",
+                'acc@1': f"{acc1_i.item():.2%}",
+                'acc@5': f"{acc5_i.item():.2%}",
+            })
+
+        progress_bar.close()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t = time() - t0
+        return loss.avg, acc1.avg, acc5.avg, t
+
+    loss, acc1, acc5, t = val_epoch()
+    logger.info(f"Initial Val Loss: {loss:.4f} Acc@1: {acc1:.2%} Acc@5: {acc5:.2%} Time: {t:.2f}s")
+    for epoch in range(start_epoch, cfg.n_epochs + 1):
+        last_epoch = epoch == cfg.n_epochs
+        logger.info(f"Epoch: {epoch}/{cfg.n_epochs}")
+
+        # Train
+        loss, acc1, acc5, t = train_epoch()
+        logger.info(f"{'Train':<5} Loss: {loss:.4f} Acc@1: {acc1:.2%} Acc@5: {acc5:.2%} Time: {t:.2f}s")
         if cfg.logging.wandb.enable:
             wandb.log({
                 'epoch': epoch,
-                'train/loss': loss.avg,
-                'train/acc@1': acc1.avg,
-                'train/acc@5': acc5.avg,
+                'train/loss': loss,
+                'train/acc@1': acc1,
+                'train/acc@5': acc5,
                 'train/time': t,
             })
-        progress_bar.close()
 
         # Val
-        if epoch == start_epoch or last_epoch or epoch % cfg.val_every_epoch == 0:
-            progress_bar = tqdm(val_loader, dynamic_ncols=True, desc="Val", leave=False)
-            model.eval()
-            t0 = time()
-            loss, acc1, acc5 = AverageMetric(), AverageMetric(), AverageMetric()
-            with torch.no_grad():
-                for step, batch in enumerate(progress_bar):
-                    imgs, lbls = batch[0].to(device), batch[1].to(device)
-                    with autocast_ctx:
-                        pred = model(imgs)
-                        loss_i = F.cross_entropy(pred, lbls)
-                    acc1_i, acc5_i = calc_accuracy(pred, lbls, (1, 5))
-                    batch_size = lbls.size(0)
-                    loss.update(loss_i.item(), batch_size)
-                    acc1.update(acc1_i.item(), batch_size)
-                    acc5.update(acc5_i.item(), batch_size)
-                    progress_bar.set_postfix({
-                        'loss': f"{loss_i.item():.4f}",
-                        'acc@1': f"{acc1_i.item():.2%}",
-                        'acc@5': f"{acc5_i.item():.2%}",
-                    })
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            t = time() - t0
-            logger.info(f"{'Val':<5} Loss: {loss.avg:.4f} Acc@1: {acc1.avg:.2%} Acc@5: {acc5.avg:.2%} Time: {t:.2f}s")
+        if last_epoch or epoch % cfg.val_every_epoch == 0:
+            loss, acc1, acc5, t = val_epoch()
+            logger.info(f"{'Val':<5} Loss: {loss:.4f} Acc@1: {acc1:.2%} Acc@5: {acc5:.2%} Time: {t:.2f}s")
             if cfg.logging.wandb.enable:
                 wandb.log({
                     'epoch': epoch,
-                    'val/loss': loss.avg,
-                    'val/acc@1': acc1.avg,
-                    'val/acc@5': acc5.avg,
+                    'val/loss': loss,
+                    'val/acc@1': acc1,
+                    'val/acc@5': acc5,
                     'val/time': t,
                 })
-            progress_bar.close()
 
         # Ckpt
         if last_epoch or epoch % cfg.save_every_epoch == 0:

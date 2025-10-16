@@ -64,7 +64,7 @@ class HFDatasetWrapper(Dataset):
 
         return image, torch.tensor(label, dtype=torch.long)
 
-supported_dataset = ["oxford-flowers102", "tiny-imagenet"]
+supported_dataset = ["oxford-flowers102", "tiny-imagenet", 'cifar100']
 def get_dataset(cfg):
     ds_cfg = cfg.dataset
     assert ds_cfg.name in supported_dataset, f"{ds_cfg.name} is not supported. Supported datasets: {supported_dataset}"
@@ -92,6 +92,9 @@ def get_dataset(cfg):
     if ds_cfg.name == "oxford-flowers102":
         train_ds = datasets.ImageFolder(cache_dir / "train", transform=train_transforms)
         val_ds = datasets.ImageFolder(cache_dir / "val", transform=val_transforms)
+    elif ds_cfg.name == "cifar100":
+        train_ds = datasets.CIFAR100(cache_dir / "train", train=True, download=True, transform=train_transforms)
+        val_ds = datasets.CIFAR100(cache_dir / "val", train=False, download=True, transform=train_transforms)
     else:
         train_ds = load_dataset('Maysee/tiny-imagenet', split='train', cache_dir=cache_dir)
         val_ds = load_dataset('Maysee/tiny-imagenet', split='valid', cache_dir=cache_dir)
