@@ -5,6 +5,8 @@ defaults:
 
 rng_seed: 31415
 
+interactive: true
+
 model_name: ${model.name}-${dataset.name}
 n_epochs: 100
 save_every_epoch: 20
@@ -32,6 +34,10 @@ lr_scheduler:
   min_lr_pct: 0.1
   warmup_pct: 0.1
   decay_step_pct: 0.6
+
+deit:
+  enable: false
+  teacher_name: null
 
 logging:
   log_dir: ./logs

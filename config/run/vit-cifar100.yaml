@@ -1,0 +1,4 @@
+# @package _global_
+defaults:
+  - override /dataset: cifar100
+  - override /model: ViT-T-8

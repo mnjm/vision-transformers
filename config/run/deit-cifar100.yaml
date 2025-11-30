@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - override /dataset: cifar100
+  - override /model: DeiT-T-8
+
+deit:
+  enable: true
+  teacher_name: resnet18_cifar100

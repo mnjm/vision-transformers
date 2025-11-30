@@ -1,7 +1,0 @@
-name: "oxford-flowers102"
-img_size: 224
-img_chls: 3
-aug:
-  center_crop: 256
-  hor_flip_aug: true
-n_class: 102

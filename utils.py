@@ -1,13 +1,13 @@
 import math
+import os
 from datetime import datetime
-from pathlib import Path
+from functools import wraps
+from time import time
 import pytz
 import torch
-import torchvision.transforms.v2 as T
-from datasets import load_dataset
+import wandb
+from dotenv import load_dotenv
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import Dataset
-from torchvision import datasets
 
 def torch_get_device(device_type):
     if device_type == "cuda":
@@ -29,7 +29,10 @@ def torch_get_device(device_type):
 
 def torch_set_seed(seed):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 def torch_compile_ckpt_fix(state_dict):
     # when torch.compiled a model, state_dict is updated with a prefix '_orig_mod.', renaming this
@@ -43,64 +46,6 @@ def get_ist_time_now(fmt="%d-%m-%Y-%H%M%S"):
     tz = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(tz)
     return now_ist.strftime(fmt)
-
-class HFDatasetWrapper(Dataset):
-
-    def __init__(self, hf_dataset, transform=None):
-        super().__init__()
-        self.dataset = hf_dataset
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        image = item['image'].convert('RGB')
-        label = item['label']
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, torch.tensor(label, dtype=torch.long)
-
-supported_dataset = ["oxford-flowers102", "tiny-imagenet", 'cifar100']
-def get_dataset(cfg):
-    ds_cfg = cfg.dataset
-    assert ds_cfg.name in supported_dataset, f"{ds_cfg.name} is not supported. Supported datasets: {supported_dataset}"
-
-    cache_dir = Path("./dataset") / ds_cfg.name
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    transforms = []
-    if getattr(ds_cfg.aug, 'hor_flip_aug', False):
-        transforms.append(T.RandomHorizontalFlip())
-    if getattr(ds_cfg.aug, "rand_augment", False):
-        transforms.append(T.RandAugment())
-    # prefer rand augment if both rand augment and auto augment is enabled
-    elif getattr(ds_cfg.aug, "auto_augment", False):
-        transforms.append(T.AutoAugment(T.AutoAugmentPolicy.IMAGENET))
-
-    resize = [ T.Resize(ds_cfg.img_size) ]
-    cast_scale = [
-        T.ToImage(),
-        T.ToDtype(torch.float32, scale=False),
-        T.Normalize(mean=[0.5]*ds_cfg.img_chls, std=[0.5]*ds_cfg.img_chls),
-    ]
-    train_transforms = T.Compose(resize + transforms + cast_scale)
-    val_transforms = T.Compose(resize + cast_scale)
-    if ds_cfg.name == "oxford-flowers102":
-        train_ds = datasets.ImageFolder(cache_dir / "train", transform=train_transforms)
-        val_ds = datasets.ImageFolder(cache_dir / "val", transform=val_transforms)
-    elif ds_cfg.name == "cifar100":
-        train_ds = datasets.CIFAR100(cache_dir / "train", train=True, download=True, transform=train_transforms)
-        val_ds = datasets.CIFAR100(cache_dir / "val", train=False, download=True, transform=train_transforms)
-    else:
-        train_ds = load_dataset('Maysee/tiny-imagenet', split='train', cache_dir=cache_dir)
-        val_ds = load_dataset('Maysee/tiny-imagenet', split='valid', cache_dir=cache_dir)
-        train_ds = HFDatasetWrapper(train_ds, transform=train_transforms)
-        val_ds = HFDatasetWrapper(val_ds, transform=val_transforms)
-    return train_ds, val_ds
 
 def cosine_with_linear_warmup_lr_scheduler(optimizer, total_steps, warmup_pct, decay_step_pct, min_lr_pct):
     """
@@ -157,3 +102,40 @@ class AverageMetric:
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count if self.count > 0 else 0
+
+def timer(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        t0 = time()
+        ret = func(*args, **kwargs)
+        t = time() - t0
+        return t, ret
+    return wrapper
+
+class WandBLogger:
+
+    def __init__(self, project, run, config, tags, metrics, enable=False):
+        self.enable = enable
+        if self.enable:
+            load_dotenv()
+            wnb_key = os.getenv('WANDB_API_KEY')
+            assert wnb_key is not None, "WANDB_API_KEY not loaded in env"
+            wandb.login(key=wnb_key)
+            wandb.init(project=project, name=run, config=config)
+            self.tags = tags
+            self.metrics = metrics
+            wandb.define_metric("epoch")
+            for tag in tags:
+                for metric in metrics:
+                    wandb.define_metric(f"{tag}/{metric}", step_metric="epoch")
+
+    def log(self, tag, data):
+        if self.enable:
+            assert tag in self.tags, f"{tag=} not created"
+            new_data = {'epoch': data['epoch']}
+            for metric, val in data.items():
+                if metric == "epoch":
+                    continue
+                assert metric in self.metrics, f"{metric=} not created"
+                new_data[f"{tag}/{metric}"] = val
+            wandb.log(new_data)
