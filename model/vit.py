@@ -26,10 +26,10 @@ class ViTConfig:
 
 class PatchEmbed(nn.Module):
 
-    def __init__(self, cfg: ViTConfig):
+    def __init__(self, img_size, patch_size, in_dim, out_dim):
         super().__init__()
-        assert cfg.img_size % cfg.patch_size == 0, f"{cfg.patch_size=} must evenly divide {cfg.img_size=}"
-        self.proj = nn.Conv2d(cfg.img_chls, cfg.n_embd, kernel_size=cfg.patch_size, stride=cfg.patch_size, bias=True)
+        assert img_size % patch_size == 0, f"{patch_size=} must evenly divide {img_size=}"
+        self.proj = nn.Conv2d(in_dim, out_dim, kernel_size=patch_size, stride=patch_size, bias=True)
         self.re = Rearrange("b c h w -> b (h w) c")
 
     def forward(self, x):
@@ -38,12 +38,12 @@ class PatchEmbed(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, cfg: ViTConfig):
+    def __init__(self, in_features, hidden_features, out_features, act_fn=nn.GELU, drop_rate=.0):
         super().__init__()
-        self.fc1 = nn.Linear(cfg.n_embd, cfg.mlp_dim)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(cfg.mlp_dim, cfg.n_embd)
-        self.drop = nn.Dropout(cfg.drop_rate)
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_fn()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop_rate)
 
     def forward(self, x):
         x = self.fc1(x)
@@ -55,25 +55,24 @@ class MLP(nn.Module):
 
 class MultiHeadSelfAttention(nn.Module):
 
-    def __init__(self, cfg: ViTConfig, enable_flash_attn=True):
+    def __init__(self, dim, n_heads, attn_drop_rate=.0, proj_drop_rate=.0, enable_flash_attn=False):
         super().__init__()
-        assert cfg.n_embd % cfg.n_heads == 0
-        self.n_heads = cfg.n_heads
-        head_dim = cfg.n_embd // cfg.n_heads
+        assert dim % n_heads == 0
+        self.n_heads = n_heads
+        head_dim = dim // n_heads
         self.flash_attn = enable_flash_attn and hasattr(F, 'scaled_dot_product_attention')
-        if self.flash_attn:
-            self.attn_drop_rate = cfg.attn_drop_rate
-        else:
-            self.scale = head_dim ** -0.5
-            self.attn_drop = nn.Dropout(cfg.attn_drop_rate)
-        self.qkv = nn.Linear(cfg.n_embd, cfg.n_embd * 3)
-        self.re_qkv = Rearrange("b n (t h d) -> t b h n d", t=3, h=cfg.n_heads, d=head_dim)
-        self.re_merge = Rearrange("b h n d -> b n (h d)")
-        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd)
-        self.proj_drop = nn.Dropout(cfg.drop_rate)
+        self.attn_drop_rate = attn_drop_rate
+        self.scale = head_dim ** -0.5
+        if not self.flash_attn:
+            self.attn_drop = nn.Dropout(attn_drop_rate)
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.split_qkv = Rearrange("b n (t h d) -> t b h n d", t=3, h=n_heads, d=head_dim)
+        self.merge_qkv = Rearrange("b h n d -> b n (h d)")
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop_rate)
 
     def forward(self, x):
-        q, k, v = self.re_qkv(self.qkv(x))
+        q, k, v = self.split_qkv(self.qkv(x))
         if self.flash_attn:
             drop_p = self.attn_drop_rate if self.training else 0.0
             x = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=drop_p)
@@ -82,7 +81,7 @@ class MultiHeadSelfAttention(nn.Module):
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
-        x = self.re_merge(x)
+        x = self.merge_qkv(x)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -107,12 +106,13 @@ class StochDepthDrop(nn.Module):
         return out
 
 class Block(nn.Module):
-    def __init__(self, cfg: ViTConfig, drop_path_prob: float, enable_flash_attn=True):
+
+    def __init__(self, dim, n_heads, mlp_dim, attn_drop_rate, drop_rate, drop_path_prob, enable_flash_attn=True):
         super().__init__()
-        self.norm1 = nn.LayerNorm(cfg.n_embd)
-        self.attn = MultiHeadSelfAttention(cfg, enable_flash_attn=enable_flash_attn)
-        self.norm2 = nn.LayerNorm(cfg.n_embd)
-        self.mlp = MLP(cfg)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = MultiHeadSelfAttention(dim=dim, n_heads=n_heads, attn_drop_rate=attn_drop_rate, proj_drop_rate=drop_rate, enable_flash_attn=enable_flash_attn)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, mlp_dim, dim)
         self.drop_path_attn = StochDepthDrop(drop_path_prob)
         self.drop_path_mlp = StochDepthDrop(drop_path_prob)
 
@@ -127,14 +127,15 @@ class ViT(nn.Module):
         super().__init__()
         self.cfg = cfg
         L = cfg.n_layer
-        self.patch_embed = PatchEmbed(cfg)
+        self.patch_embed = PatchEmbed(cfg.img_size, cfg.patch_size, cfg.img_chls, cfg.n_embd)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, cfg.n_embd))
         self.pos_embed = nn.Parameter(torch.zeros(1, 1 + cfg.num_patches, cfg.n_embd))
         self.pos_drop = nn.Dropout(cfg.drop_rate)
         self.blocks = nn.ModuleList(
             Block(
-                cfg,
-                (l + 1) / L * cfg.stoch_depth_drop_rate,
+                dim=cfg.n_embd, n_heads=cfg.n_heads, mlp_dim=cfg.mlp_dim,
+                attn_drop_rate=cfg.attn_drop_rate, drop_rate=cfg.drop_rate,
+                drop_path_prob=(l + 1) / L * cfg.stoch_depth_drop_rate,
                 enable_flash_attn=enable_flash_attn,
             )
             for l in range(L) # noqa: E741
