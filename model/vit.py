@@ -26,15 +26,18 @@ class ViTConfig:
 
 class PatchEmbed(nn.Module):
 
-    def __init__(self, img_size, patch_size, in_dim, out_dim):
+    def __init__(self, img_size, patch_size, in_dim, out_dim, norm_lyr=nn.Identity):
         super().__init__()
         assert img_size % patch_size == 0, f"{patch_size=} must evenly divide {img_size=}"
         self.proj = nn.Conv2d(in_dim, out_dim, kernel_size=patch_size, stride=patch_size, bias=True)
         self.re = Rearrange("b c h w -> b (h w) c")
+        self.norm = norm_lyr(out_dim)
 
     def forward(self, x):
         x = self.proj(x) # (B, n_embd, H/patch_size, W/patch_size)
-        return self.re(x) # (B, n_patches, n_embed)
+        x = self.re(x) # (B, n_patches, n_embed)
+        x = self.norm(x)
+        return x
 
 class MLP(nn.Module):
 
@@ -107,12 +110,13 @@ class StochDepthDrop(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, dim, n_heads, mlp_dim, attn_drop_rate, drop_rate, drop_path_prob, enable_flash_attn=True):
+    def __init__(self, dim, n_heads, mlp_dim, attn_drop_rate, proj_drop_rate, drop_path_prob, enable_flash_attn=True, mlp_drop_rate=None):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiHeadSelfAttention(dim=dim, n_heads=n_heads, attn_drop_rate=attn_drop_rate, proj_drop_rate=drop_rate, enable_flash_attn=enable_flash_attn)
+        self.attn = MultiHeadSelfAttention(dim=dim, n_heads=n_heads, attn_drop_rate=attn_drop_rate, proj_drop_rate=proj_drop_rate, enable_flash_attn=enable_flash_attn)
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, mlp_dim, dim)
+        mlp_drop_rate = proj_drop_rate if mlp_drop_rate is None else mlp_drop_rate
+        self.mlp = MLP(dim, mlp_dim, dim, drop_rate=mlp_drop_rate)
         self.drop_path_attn = StochDepthDrop(drop_path_prob)
         self.drop_path_mlp = StochDepthDrop(drop_path_prob)
 
@@ -134,7 +138,7 @@ class ViT(nn.Module):
         self.blocks = nn.ModuleList(
             Block(
                 dim=cfg.n_embd, n_heads=cfg.n_heads, mlp_dim=cfg.mlp_dim,
-                attn_drop_rate=cfg.attn_drop_rate, drop_rate=cfg.drop_rate,
+                attn_drop_rate=cfg.attn_drop_rate, proj_drop_rate=cfg.drop_rate,
                 drop_path_prob=(l + 1) / L * cfg.stoch_depth_drop_rate,
                 enable_flash_attn=enable_flash_attn,
             )
@@ -165,8 +169,8 @@ class ViT(nn.Module):
     def forward(self, imgs, lbls=None):
         B = imgs.shape[0]
         x = self.patch_embed(imgs)                         # (B,num_patches,n_embd)
-        cls_tokens = self.cls_token.expand(B, -1, -1)   # (B,1,n_embd)
-        x = torch.cat((cls_tokens, x), dim=1)           # prepend [CLS]
+        cls_tokens = self.cls_token.expand(B, -1, -1)      # (B,1,n_embd)
+        x = torch.cat((cls_tokens, x), dim=1)              # prepend [CLS]
         x = x + self.pos_embed
         x = self.pos_drop(x)
 
