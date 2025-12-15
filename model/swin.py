@@ -107,20 +107,21 @@ class ShiftedWindowMHSA(nn.Module):
     def forward(self, x, mask=None):
         B, N, C = x.shape
 
-        tbl = self.relative_position_bias_table[self.relative_position_index.view(-1)]
-        rel_pos_bias = einops.rearrange(
-            tbl,
-            "(h w) c -> 1 c h w",
-            h=self.window_size[0] * self.window_size[1],
-            w=self.window_size[0] * self.window_size[1],
-        )
+        tbl = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)
+        ]
+        rel_pos_bias = tbl.view(
+            self.window_size[0] * self.window_size[1],
+            self.window_size[0] * self.window_size[1],
+            -1
+        ).permute(2, 0, 1).unsqueeze(0)
 
         # mask expected as (num_windows_total, N, N) and num_windows_total = batch_size * windows_per_img
         shift_mask = None
         if mask is not None:
             windows_per_img = B // mask.shape[0]
             assert B % mask.shape[0] == 0
-            shift_mask = einops.repeat(mask, "nw h w -> (nw repeats) 1 h w", repeats=windows_per_img)
+            shift_mask = einops.repeat(mask, "nw h w -> (repeats nw) 1 h w", repeats=windows_per_img)
 
         q, k, v = self.split_qkv(self.qkv(x))
 
@@ -230,7 +231,7 @@ class PatchMerge(nn.Module):
         self.input_res = input_res
         H, W = self.input_res
         assert H % 2 == 0 and W % 2 == 0, f"input size is not even {H}x{W}"
-        self.re = Rearrange('b (h ph) (w pw) c -> b (h w) (ph pw c)', ph=2, pw=2)
+        self.re = Rearrange('b (h ph) (w pw) c -> b (h w) (pw ph c)', ph=2, pw=2)
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_lyr(4 * dim)
 
@@ -243,7 +244,6 @@ class PatchMerge(nn.Module):
         x = self.re(x)
         x = self.norm(x)
         x = self.reduction(x)
-
         return x
 
 class SwinLayer(nn.Module):
@@ -311,7 +311,6 @@ class SwinTransformer(nn.Module):
 
         self.n_features = int(cfg.n_embed * 2 ** (self.n_layers - 1))
         self.norm = nn.LayerNorm(self.n_features)
-        self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Linear(self.n_features, cfg.n_class) if cfg.n_class > 0 else nn.Identity()
         self.apply(self._init_weights)
 
@@ -334,48 +333,9 @@ class SwinTransformer(nn.Module):
             x = lyr(x)
 
         x = self.norm(x) # B, L, C
-        x = self.avgpool(x.transpose(1, 2)) # B, C, 1
-        x = torch.flatten(x, 1) # B, C
+        x = x.mean(dim=1)
         x = self.head(x) # B, n_class
         if y is not None:
             loss = self.loss_fn(x, y)
             return x, loss
         return x
-
-if __name__ == "__main__":
-    from torchvision.models.swin_transformer import swin_b, swin_s, swin_t
-    from pathlib import Path
-    from omegaconf import OmegaConf
-
-    cfg = SwinTransformerConfig()
-    model = SwinTransformer(cfg)
-
-    dummy = torch.randn(2, 3, cfg.img_size, cfg.img_size)
-    out = model(dummy)
-    assert out.shape == (2, 1000), f"Output mismatch {out.shape}"
-
-    # Test all available vit models from `torchvision.models`
-    model_map = {
-        'Swin-B': swin_b,
-        'Swin-T': swin_t,
-        'Swin-S': swin_s,
-    }
-    yml_files = Path("./config/model").glob("*.yaml")
-    for yml_file in yml_files:
-        cfg = OmegaConf.load(yml_file)
-        cfg.img_size = 224
-        cfg.img_chls = 3
-        cfg.n_class = 1000
-        name = cfg.name
-        kwargs = dict(cfg)
-        if name not in model_map:
-            continue
-        pt_model = model_map[name]()
-        pt_params = sum(p.numel() for p in pt_model.parameters())
-        my_model = SwinTransformer(SwinTransformerConfig(**kwargs))
-        my_params = sum(p.numel() for p in my_model.parameters())
-        assert pt_params == my_params, f"{name} params mismatch {pt_params=} {my_params=}"
-
-    print("="*20)
-    print("Success")
-    print("="*20)

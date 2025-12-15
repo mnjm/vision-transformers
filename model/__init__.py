@@ -3,18 +3,24 @@ import detectors  # noqa: F401
 import timm
 from .vit import ViTConfig, ViT
 from .deit import DeitConfig, DeiT
+from .swin import SwinTransformer, SwinTransformerConfig
 
 def init_model(cfg):
-    if getattr(cfg, 'model', False) and getattr(cfg.model, 'use_dist_token', False):
+    name = cfg.model.name
+    if name.startswith("DeiT"):
+        assert getattr(cfg.model, 'use_dist_token', False), "Enable use_dist_token in DeiT model config"
         model_cfg = DeitConfig(**cfg.model)
         model = DeiT(model_cfg)
+    elif name.startswith("Swin"):
+        model_cfg = SwinTransformerConfig(**cfg.model)
+        model = SwinTransformer(model_cfg)
     else:
         model_cfg = ViTConfig(**cfg.model)
         model = ViT(model_cfg)
     return model
 
 def init_deit(model, cfg, device, logger):
-    assert isinstance(model, DeiT), "Model should be DeiT. Make sure to set 'use_dist_token = true' in model config"
+    assert isinstance(model, DeiT), "Model should be DeiT"
     teacher_name = cfg.deit.teacher_name
     # load teacher model
     teacher = timm.create_model(teacher_name, pretrained=True)
