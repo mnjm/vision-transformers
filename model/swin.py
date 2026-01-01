@@ -4,7 +4,7 @@ from torch import nn
 import torch.nn.functional as F
 import einops
 from einops.layers.torch import Rearrange
-from .vit import MLP, PatchEmbed, StochDepthDrop
+from .vit import MLP, PatchEmbed, StochDepthDrop, _configure_optimizer
 from dataclasses import dataclass, field
 
 @dataclass
@@ -146,10 +146,15 @@ class SwinTransformerBlock(nn.Module):
                  proj_drop_rate, path_drop_rate, act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
-        self.input_res = input_res
+        self.input_res = to_2tuple(input_res)
         self.n_heads = n_heads
         self.window_size = to_2tuple(window_size)
         self.shift_size = shift_size
+
+        # if window size is larger than input resolution in either, do not partition windows
+        if self.input_res[0] <= self.window_size[0] or self.input_res[1] <= self.window_size[1]:
+            self.shift_size = 0
+            self.window_size = self.input_res
 
         assert 0 <= self.shift_size <= min(self.window_size), "shift size should be within 0 - window_size"
 
@@ -339,3 +344,6 @@ class SwinTransformer(nn.Module):
             loss = self.loss_fn(x, y)
             return x, loss
         return x
+
+    def configure_optimizer(self, optim_cfg, device):
+        return _configure_optimizer(self, optim_cfg, device)

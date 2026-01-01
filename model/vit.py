@@ -186,18 +186,21 @@ class ViT(nn.Module):
         return logits
 
     def configure_optimizer(self, optim_cfg, device):
-        optim_cfg.fused = getattr(optim_cfg, 'fused', False) and device.type == "cuda"
-        params_dict = { pn: p for pn, p in self.named_parameters() }
-        params_dict = { pn:p for pn, p in params_dict.items() if p.requires_grad } # filter params that requires grad
-        # create optim groups of any params that is 2D or more. This group will be weight decayed ie weight tensors in Linear and embeddings
-        decay_params = [ p for p in params_dict.values() if p.dim() >= 2]
-        # create optim groups of any params that is 1D. All biases and layernorm params
-        no_decay_params = [ p for p in params_dict.values() if p.dim() < 2]
-        weight_decay = getattr(optim_cfg, 'weight_decay', 0.0)
-        optim_cfg.weight_decay = .0
-        optim_groups = [
-            { 'params': decay_params, 'weight_decay': weight_decay },
-            { 'params': no_decay_params, 'weight_decay': 0.0 },
-        ]
-        optimizer = instantiate(optim_cfg, params=optim_groups, _convert_="all")
-        return optimizer
+        return _configure_optimizer(self, optim_cfg, device)
+
+def _configure_optimizer(model, optim_cfg, device):
+    optim_cfg.fused = getattr(optim_cfg, 'fused', False) and device.type == "cuda"
+    params_dict = { pn: p for pn, p in model.named_parameters() }
+    params_dict = { pn:p for pn, p in params_dict.items() if p.requires_grad } # filter params that requires grad
+    # create optim groups of any params that is 2D or more. This group will be weight decayed ie weight tensors in Linear and embeddings
+    decay_params = [ p for p in params_dict.values() if p.dim() >= 2]
+    # create optim groups of any params that is 1D. All biases and layernorm params
+    no_decay_params = [ p for p in params_dict.values() if p.dim() < 2]
+    weight_decay = getattr(optim_cfg, 'weight_decay', 0.0)
+    optim_cfg.weight_decay = .0
+    optim_groups = [
+        { 'params': decay_params, 'weight_decay': weight_decay },
+        { 'params': no_decay_params, 'weight_decay': 0.0 },
+    ]
+    optimizer = instantiate(optim_cfg, params=optim_groups, _convert_="all")
+    return optimizer
