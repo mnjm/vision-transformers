@@ -1,11 +1,13 @@
 # Ref: https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
 import torch
-from torch import nn
-import torch.nn.functional as F
 import einops
+import torch.nn.functional as F
+from torch import nn
+from torch.nn.attention.flex_attention import flex_attention
 from einops.layers.torch import Rearrange
-from .vit import MLP, PatchEmbed, StochDepthDrop, _configure_optimizer
 from dataclasses import dataclass, field
+from functools import partial
+from .vit import MLP, PatchEmbed, StochDepthDrop, _configure_optimizer
 
 @dataclass
 class SwinTransformerConfig:
@@ -69,7 +71,7 @@ def window_reverse(windows, window_size, H, W):
 
 class ShiftedWindowMHSA(nn.Module):
 
-    def __init__(self, dim, window_size, n_heads, attn_drop_rate=.0, proj_drop_rate=.0):
+    def __init__(self, dim, window_size, n_heads, attn_drop_rate=.0, proj_drop_rate=.0, use_flex_attn=False):
         super().__init__()
         self.dim = dim
         self.window_size = to_2tuple(window_size)
@@ -95,6 +97,7 @@ class ShiftedWindowMHSA(nn.Module):
 
         self.split_qkv = Rearrange("b n (t h d) -> t b h n d", t=3, h=n_heads, d=self.head_dim)
         self.qkv = nn.Linear(dim, dim * 3)
+        self.use_flex_attn = use_flex_attn
         self.merge_qkv = Rearrange("b h n d -> b n (h d)")
 
         self.attn_drop_rate = attn_drop_rate
@@ -105,45 +108,78 @@ class ShiftedWindowMHSA(nn.Module):
         nn.init.trunc_normal_(self.relative_position_bias_table, std=.02)
 
     def forward(self, x, mask=None):
-        B, N, C = x.shape
-
-        tbl = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ]
-        rel_pos_bias = tbl.view(
-            self.window_size[0] * self.window_size[1],
-            self.window_size[0] * self.window_size[1],
-            -1
-        ).permute(2, 0, 1).unsqueeze(0)
-
-        # mask expected as (num_windows_total, N, N) and num_windows_total = batch_size * windows_per_img
-        shift_mask = None
-        if mask is not None:
-            windows_per_img = B // mask.shape[0]
-            assert B % mask.shape[0] == 0
-            shift_mask = einops.repeat(mask, "nw h w -> (repeats nw) 1 h w", repeats=windows_per_img)
+        Bw, N, C = x.shape # Bw = batch_size * images_per_window, N = window_size
 
         q, k, v = self.split_qkv(self.qkv(x))
 
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-        attn = attn + rel_pos_bias
-        if shift_mask is not None:
-            attn = attn + shift_mask
-        attn = attn.softmax(dim=-1)
-        attn = F.dropout(attn, self.attn_drop_rate, training=self.training)
-        x = attn @ v
+        rel_pos_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)
+        ]
+        rel_pos_bias = rel_pos_bias.view(
+            self.window_size[0] * self.window_size[1],
+            self.window_size[0] * self.window_size[1],
+            -1
+        ).permute(2, 0, 1).contiguous()
 
+        # mask expected as (windows_per_img, window_size, window_size)
+        windows_per_img = mask.shape[0] if mask is not None else 0
+        if self.use_flex_attn:
+            score_mod_fn = partial(
+                swin_score_mod,
+                rel_pos_bias=rel_pos_bias,
+                shift_mask=mask,
+                windows_per_img=windows_per_img
+            )
+            x = flex_attention(
+                q, k, v,
+                scale=self.scale,
+                score_mod=score_mod_fn,
+            )
+        else:
+            shift_mask = None
+            if mask is not None:
+                B = Bw // windows_per_img
+                assert Bw % mask.shape[0] == 0
+                # materializing the attention mask for the whole batch by repeating, waste of memory
+                shift_mask = einops.repeat(mask, "nw h w -> (b nw) 1 h w", b=B)
+
+            q = q * self.scale
+            attn = (q @ k.transpose(-2, -1))
+            attn = attn + rel_pos_bias.unsqueeze(0)
+            if shift_mask is not None:
+                attn = attn + shift_mask
+            attn = attn.softmax(dim=-1)
+            x = attn @ v
+
+        # Note: Original Swin Transformer code applies dropout to attention probs. Here I opted to apply
+        # to attention output (post-attention dropout) as it is slightly stable.
+        x = F.dropout(x, self.attn_drop_rate, training=self.training)
         x = self.merge_qkv(x)
         x = self.proj(x)
         x = self.proj_drop(x)
 
         return x
 
+def swin_score_mod(score, b, h, q_idx, kv_idx, rel_pos_bias, shift_mask, windows_per_img):
+    """
+    FlexAttention score modifier functn for swin transformer.
+    Handles both relative position bias and shifted window masking.
+    Input:
+        rel_pos_bias: Tensor (n_heads, window_size, window_size)
+        shift_mask: Tensor (n_windows, window_size, window_size)
+    """
+    score = score + rel_pos_bias[h, q_idx, kv_idx]
+    if shift_mask is not None:
+        window_idx = b % windows_per_img
+        mask_val = shift_mask[window_idx, q_idx, kv_idx]
+        score = torch.where(mask_val == 0, score, score.new_full((), -100.0))
+        # score.new_full((), -100.0) -> kernel friendly way of allocating a scaler tensor -100 with same device,dtype as score
+    return score
+
 class SwinTransformerBlock(nn.Module):
 
     def __init__(self, dim, input_res, n_heads, window_size, shift_size, mlp_ratio, attn_drop_rate,
-                 proj_drop_rate, path_drop_rate, act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 proj_drop_rate, path_drop_rate, act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_flex_attn=False):
         super().__init__()
         self.dim = dim
         self.input_res = to_2tuple(input_res)
@@ -160,15 +196,17 @@ class SwinTransformerBlock(nn.Module):
 
         self.attn_norm = norm_layer(dim)
         self.attn = ShiftedWindowMHSA(
-            dim=self.dim, window_size=self.window_size, n_heads=self.n_heads,
-            attn_drop_rate=attn_drop_rate, proj_drop_rate=proj_drop_rate
+            dim=self.dim, window_size=self.window_size, n_heads=self.n_heads, attn_drop_rate=attn_drop_rate,
+            proj_drop_rate=proj_drop_rate, use_flex_attn=use_flex_attn
         )
 
         self.drop_path = StochDepthDrop(drop_prob=path_drop_rate)
 
         self.mlp_norm = norm_layer(dim)
-        self.mlp = MLP(in_features=self.dim, hidden_features=int(self.dim * mlp_ratio), out_features=self.dim, act_fn=act_layer, drop_rate=proj_drop_rate)
-
+        self.mlp = MLP(
+            in_features=self.dim, hidden_features=int(self.dim * mlp_ratio), out_features=self.dim,
+            act_fn=act_layer, drop_rate=proj_drop_rate
+        )
 
         if self.shift_size > 0:
             # calculate attention mask for SW-MSA
@@ -254,7 +292,8 @@ class PatchMerge(nn.Module):
 class SwinLayer(nn.Module):
 
     def __init__(self, dim, input_res, depth, n_heads, window_size, mlp_ratio, proj_drop_rate,
-                 attn_drop_rate, path_drop_rate, norm_layer=nn.LayerNorm, downsample=False):
+                 attn_drop_rate, path_drop_rate, norm_layer=nn.LayerNorm, downsample=False,
+                 use_flex_attn=False):
         super().__init__()
         self.dim = dim
         self.input_res = input_res
@@ -265,7 +304,7 @@ class SwinLayer(nn.Module):
                 shift_size= 0 if (l % 2 == 0) else window_size // 2, mlp_ratio=mlp_ratio,
                 proj_drop_rate=proj_drop_rate, attn_drop_rate=attn_drop_rate,
                 path_drop_rate=path_drop_rate[l] if isinstance(path_drop_rate, list) else path_drop_rate,
-                norm_layer=norm_layer
+                norm_layer=norm_layer, use_flex_attn=use_flex_attn
             )
             for l in range(depth)
         )
@@ -286,7 +325,7 @@ class SwinLayer(nn.Module):
 
 class SwinTransformer(nn.Module):
 
-    def __init__(self, cfg: SwinTransformerConfig):
+    def __init__(self, cfg: SwinTransformerConfig, use_flex_attn=False):
         super().__init__()
 
         self.cfg = cfg
@@ -309,7 +348,8 @@ class SwinTransformer(nn.Module):
                 depth=cfg.depths[l], n_heads=cfg.n_heads[l], window_size=cfg.window_size,
                 mlp_ratio=cfg.mlp_ratio, proj_drop_rate=cfg.drop_rate,
                 attn_drop_rate=cfg.attn_drop_rate, downsample=(l < self.n_layers - 1),
-                path_drop_rate=stoch_depth_drop_rates[sum(cfg.depths[:l]):sum(cfg.depths[:l+1])]
+                path_drop_rate=stoch_depth_drop_rates[sum(cfg.depths[:l]):sum(cfg.depths[:l+1])],
+                use_flex_attn=use_flex_attn
             )
             for l in range(self.n_layers)
         )
@@ -347,3 +387,10 @@ class SwinTransformer(nn.Module):
 
     def configure_optimizer(self, optim_cfg, device):
         return _configure_optimizer(self, optim_cfg, device)
+
+if __name__ == '__main__':
+    use_flex_attn = True
+    model = SwinTransformer(SwinTransformerConfig(), use_flex_attn=use_flex_attn)
+    x = torch.randn((2, 3, 224, 224))
+    y = model(x)
+    print(y.shape)

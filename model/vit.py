@@ -127,7 +127,7 @@ class Block(nn.Module):
 
 class ViT(nn.Module):
 
-    def __init__(self, cfg: ViTConfig, enable_flash_attn=True):
+    def __init__(self, cfg: ViTConfig, enable_flash_attn=False):
         super().__init__()
         self.cfg = cfg
         L = cfg.n_layer

@@ -39,12 +39,12 @@ def main(cfg):
 
     start_epoch = 1
     if cfg.init_from == 'scratch':
-        model = init_model(cfg)
+        model = init_model(cfg, device)
         model.to(device)
     else:
         ckpt = torch.load(cfg.init_from, map_location=device, weights_only=False)
         ckpt_cfg = ckpt['config']
-        model = init_model(ckpt_cfg)
+        model = init_model(ckpt_cfg, device)
         assert cfg.dataset.name == ckpt_cfg.dataset.name, f"Different dataset: {ckpt_cfg.dataset.name}"
         model.to(device)
         model.load_state_dict(torch_compile_ckpt_fix(ckpt['model']))
