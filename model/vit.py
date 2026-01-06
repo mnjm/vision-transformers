@@ -70,7 +70,7 @@ class MultiHeadSelfAttention(nn.Module):
             self.attn_drop = nn.Dropout(attn_drop_rate)
         self.qkv = nn.Linear(dim, dim * 3)
         self.split_qkv = Rearrange("b n (t h d) -> t b h n d", t=3, h=n_heads, d=head_dim)
-        self.merge_qkv = Rearrange("b h n d -> b n (h d)")
+        self.merge_heads = Rearrange("b h n d -> b n (h d)")
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop_rate)
 
@@ -84,7 +84,7 @@ class MultiHeadSelfAttention(nn.Module):
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
-        x = self.merge_qkv(x)
+        x = self.merge_heads(x)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

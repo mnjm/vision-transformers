@@ -119,7 +119,7 @@ def test_swin_flex_attn():
         if name not in model_map:
             continue
         model = SwinTransformer(SwinTransformerConfig(**kwargs))
-        flex_model = SwinTransformer(SwinTransformerConfig(**kwargs), use_flex_attn=True)
+        flex_model = SwinTransformer(SwinTransformerConfig(**kwargs), use_flash_attn=True)
         model.eval()
         flex_model.eval()
         flex_model.load_state_dict(model.state_dict())
