@@ -1,6 +1,10 @@
-# Ref: https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
+"""
+Minimal Swin Transformer implementation in PyTorch.
+Ref: https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
+"""
 import torch
 import torch.nn.functional as F
+import warnings
 from torch import nn
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
@@ -9,6 +13,24 @@ from .vit import MLP, PatchEmbed, StochDepthDrop, _configure_optimizer
 
 @dataclass
 class SwinTransformerConfig:
+    """Configuration for Swin Transformer.
+
+    Args:
+        name: Model name.
+        img_size: Input image size (square).
+        patch_size: Patch size.
+        patch_norm: Wheather to apply norm after patch embedding.
+        img_chls: Number of image channels.
+        n_class: Number of output classes.
+        n_embed: Base embedding dimension.
+        depths: Number of blocks per stage.
+        n_heads: Number of attention heads per stage.
+        window_size: Window size for attention.
+        mlp_ratio: MLP expansion ratio.
+        drop_rate: Dropout rate.
+        attn_drop_rate: Attention dropout rate.
+        stoch_depth_drop_rate: Stochastic depth rate.
+    """
     name: str = "Swin-T"
     img_size: int = 224
     patch_size: int = 4
@@ -27,15 +49,15 @@ class SwinTransformerConfig:
 def to_2tuple(x):
     return x if isinstance(x, (list, tuple)) else (x, x)
 
-def window_partition(x, window_size):
-    """ Partition input feature maps into non-overlapping windows
+def window_partition(x, window_size: int|tuple):
+    """Partition feature map into non-overlapping windows.
 
     Args:
-        x (Tensor): input feature maps of shape (B, H, W, C)
-        window_size (init or tuple): window size
+        x: Feature map (B, H, W, C).
+        window_size: Window size.
 
     Returns:
-        Tensor: Tensor of shape (B * num_windows, Wh, Ww, C)
+        Windows (B * num_windows, Wh, Ww, C).
     """
     B, H, W, C = x.shape
     wsh, wsw = to_2tuple(window_size)
@@ -46,17 +68,17 @@ def window_partition(x, window_size):
     )
     return windows
 
-def window_reverse(windows, window_size, H, W):
-    """ Reverses the window partition to restruct the feature map
+def window_reverse(windows, window_size: int|tuple, H:int, W:int):
+    """Reconstruct feature map from windows.
 
     Args:
-        windows (Tensor): shape (B * num_window, Wh, Ww, C)
-        window_size (int or tuple): (Wh, Wc)
-        H (int): Height of the output feature
-        W (int): Width of the output feature
+        windows: Windowed features.
+        window_size: Window size.
+        H: Output height.
+        W: Output width.
 
     Returns:
-        Tensor: reconstructed feature map
+        Feature map (B, H, W, C).
     """
     wsh, wsw = to_2tuple(window_size)
     nh, nw = H // wsh, W // wsw
@@ -68,8 +90,21 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 class ShiftedWindowMHSA(nn.Module):
+    """Window-based multi-head self-attention with relative position bias."""
 
-    def __init__(self, dim, window_size, n_heads, attn_drop_rate=.0, proj_drop_rate=.0, use_flash_attn=False):
+    def __init__(
+            self, dim: int, window_size: int, n_heads: int, attn_drop_rate: float = .0,
+            proj_drop_rate: float = .0, use_sdpa_attn: bool = True
+        ):
+        """
+        Args:
+            dim: Embedding dimension.
+            window_size: Attention window size.
+            n_heads: Number of heads.
+            attn_drop_rate: Attention dropout.
+            proj_drop_rate: Projection dropout.
+            use_sdpa_attn: Use SDPA attention.
+        """
         super().__init__()
         self.dim = dim
         self.window_size = to_2tuple(window_size)
@@ -95,7 +130,9 @@ class ShiftedWindowMHSA(nn.Module):
 
         self.split_qkv = Rearrange("b n (t h d) -> t b h n d", t=3, h=n_heads, d=self.head_dim)
         self.qkv = nn.Linear(dim, dim * 3)
-        self.use_flash_attn = use_flash_attn
+        self.use_sdpa_attn = use_sdpa_attn and hasattr(F, 'scaled_dot_product_attention')
+        if use_sdpa_attn and not self.use_sdpa_attn:
+            warnings.warn("SDPA attn is enabled but not available.")
         self.merge_heads = Rearrange("b h n d -> b n (h d)")
 
         self.attn_drop_rate = attn_drop_rate
@@ -106,7 +143,15 @@ class ShiftedWindowMHSA(nn.Module):
         nn.init.trunc_normal_(self.relative_position_bias_table, std=.02)
 
     def forward(self, x, mask=None):
-        Bw, N, C = x.shape # Bw = batch_size * images_per_window, N = window_size
+        """
+        Args:
+            x: Window tokens (Bw, N, C), where Bw = batch_size * windows_per_image, N = window_size^2
+            mask: Optional attention mask (windows_per_image, N, N)
+
+        Returns:
+            Attention output (Bw, N, C).
+        """
+        Bw, N, C = x.shape
 
         q, k, v = self.split_qkv(self.qkv(x))
 
@@ -119,19 +164,16 @@ class ShiftedWindowMHSA(nn.Module):
             -1
         ).permute(2, 0, 1).unsqueeze(0)
 
-        # mask expected as (windows_per_img, window_size, window_size)
         windows_per_img = mask.shape[0] if mask is not None else 0
-        shift_mask = None
+        full_mask = rel_pos_bias
         if mask is not None:
             B = Bw // windows_per_img
             assert Bw % mask.shape[0] == 0
             # materializing the attention mask for the whole batch
             shift_mask = repeat(mask, "nw h w -> (b nw) 1 h w", b=B)
+            full_mask = full_mask + shift_mask
 
-        if self.use_flash_attn:
-            full_mask = rel_pos_bias
-            if shift_mask is not None:
-                full_mask = rel_pos_bias + shift_mask
+        if self.use_sdpa_attn:
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=full_mask,
@@ -141,9 +183,7 @@ class ShiftedWindowMHSA(nn.Module):
         else:
             q = q * self.scale
             attn = (q @ k.transpose(-2, -1))
-            attn = attn + rel_pos_bias
-            if shift_mask is not None:
-                attn = attn + shift_mask
+            attn = attn + full_mask
             attn = attn.softmax(dim=-1)
             attn = F.dropout(attn, self.attn_drop_rate, training=self.training)
             x = attn @ v
@@ -155,9 +195,26 @@ class ShiftedWindowMHSA(nn.Module):
         return x
 
 class SwinTransformerBlock(nn.Module):
+    """Swin Transformer block with optional window shift."""
 
-    def __init__(self, dim, input_res, n_heads, window_size, shift_size, mlp_ratio, attn_drop_rate,
-                 proj_drop_rate, path_drop_rate, act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_flash_attn=False):
+    def __init__(
+            self, dim: int, input_res: int | tuple, n_heads: int, window_size: int | tuple,
+            shift_size: int, mlp_ratio: float, attn_drop_rate: float, proj_drop_rate: float,
+            path_drop_rate: float, act_layer: nn.Module = nn.GELU,
+            norm_layer: nn.Module = nn.LayerNorm, use_sdpa_attn: bool =True
+        ):
+        """
+        Args:
+            dim: Embedding dimension.
+            input_res: Input resolution.
+            n_heads: Number of heads.
+            window_size: Window size.
+            shift_size: if > 0, shifts the windows (SWMSHA) else (WMSHA)
+            mlp_ratio: MLP ratio.
+            attn_drop_rate: Attention dropout.
+            proj_drop_rate: Projection dropout.
+            path_drop_rate: Drop path rate.
+        """
         super().__init__()
         self.dim = dim
         self.input_res = to_2tuple(input_res)
@@ -175,7 +232,7 @@ class SwinTransformerBlock(nn.Module):
         self.attn_norm = norm_layer(dim)
         self.attn = ShiftedWindowMHSA(
             dim=self.dim, window_size=self.window_size, n_heads=self.n_heads, attn_drop_rate=attn_drop_rate,
-            proj_drop_rate=proj_drop_rate, use_flash_attn=use_flash_attn
+            proj_drop_rate=proj_drop_rate, use_sdpa_attn=use_sdpa_attn
         )
 
         self.drop_path = StochDepthDrop(drop_prob=path_drop_rate)
@@ -212,6 +269,13 @@ class SwinTransformerBlock(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
 
     def forward(self, x):
+        """
+        Args:
+            x: Input tokens (B, H*W, C).
+
+        Returns:
+            Output tokens (B, H*W, C).
+        """
         H, W = self.input_res
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -245,8 +309,15 @@ class SwinTransformerBlock(nn.Module):
         return x
 
 class PatchMerge(nn.Module):
+    """Patch merging layer (downsampling)."""
 
-    def __init__(self, dim, input_res, norm_lyr=nn.LayerNorm):
+    def __init__(self, dim: int, input_res: int | tuple, norm_lyr: nn.Module = nn.LayerNorm):
+        """
+        Args:
+            dim: Input embedding dim.
+            input_res: Input resolution.
+            norm_lyr: Normalization layer after projection
+        """
         super().__init__()
         self.dim = dim
         self.input_res = input_res
@@ -257,6 +328,13 @@ class PatchMerge(nn.Module):
         self.norm = norm_lyr(4 * dim)
 
     def forward(self, x):
+        """
+        Args:
+            x: Tokens (B, H*W, C).
+
+        Returns:
+            Downsampled tokens (B, H/2 * W/2, 2 * C)
+        """
         H, W = self.input_res
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -268,10 +346,22 @@ class PatchMerge(nn.Module):
         return x
 
 class SwinLayer(nn.Module):
+    """One stage of Swin Transformer."""
 
-    def __init__(self, dim, input_res, depth, n_heads, window_size, mlp_ratio, proj_drop_rate,
-                 attn_drop_rate, path_drop_rate, norm_layer=nn.LayerNorm, downsample=False,
-                 use_flash_attn=False):
+    def __init__(
+            self, dim: int, input_res: int | tuple, depth: int, n_heads: int, window_size: int | tuple,
+            mlp_ratio: float, proj_drop_rate: float, attn_drop_rate: float, path_drop_rate: float,
+            norm_layer: nn.Module = nn.LayerNorm, downsample: bool = False, use_sdpa_attn: bool = True
+        ):
+        """
+        Args:
+            dim: Embedding dim.
+            input_res: Input resolution.
+            depth: Number of blocks.
+            n_heads: Number of heads.
+            window_size: Window size.
+            downsample: Apply patch merging.
+        """
         super().__init__()
         self.dim = dim
         self.input_res = input_res
@@ -282,7 +372,7 @@ class SwinLayer(nn.Module):
                 shift_size= 0 if (l % 2 == 0) else window_size // 2, mlp_ratio=mlp_ratio,
                 proj_drop_rate=proj_drop_rate, attn_drop_rate=attn_drop_rate,
                 path_drop_rate=path_drop_rate[l] if isinstance(path_drop_rate, list) else path_drop_rate,
-                norm_layer=norm_layer, use_flash_attn=use_flash_attn
+                norm_layer=norm_layer, use_sdpa_attn=use_sdpa_attn
             )
             for l in range(depth)
         )
@@ -302,8 +392,9 @@ class SwinLayer(nn.Module):
         return x
 
 class SwinTransformer(nn.Module):
+    """Swin Transformer"""
 
-    def __init__(self, cfg: SwinTransformerConfig, use_flash_attn=False):
+    def __init__(self, cfg: SwinTransformerConfig, use_sdpa_attn: bool = True):
         super().__init__()
 
         self.cfg = cfg
@@ -327,7 +418,7 @@ class SwinTransformer(nn.Module):
                 mlp_ratio=cfg.mlp_ratio, proj_drop_rate=cfg.drop_rate,
                 attn_drop_rate=cfg.attn_drop_rate, downsample=(l < self.n_layers - 1),
                 path_drop_rate=stoch_depth_drop_rates[sum(cfg.depths[:l]):sum(cfg.depths[:l+1])],
-                use_flash_attn=use_flash_attn
+                use_sdpa_attn=use_sdpa_attn
             )
             for l in range(self.n_layers)
         )
@@ -363,12 +454,12 @@ class SwinTransformer(nn.Module):
             return x, loss
         return x
 
-    def configure_optimizer(self, optim_cfg, device):
+    def configure_optimizer(self, optim_cfg: object, device: torch.device):
         return _configure_optimizer(self, optim_cfg, device)
 
 if __name__ == '__main__':
-    use_flash_attn = True
-    model = SwinTransformer(SwinTransformerConfig(), use_flash_attn=use_flash_attn)
+    use_sdpa_attn = True
+    model = SwinTransformer(SwinTransformerConfig(), use_sdpa_attn=use_sdpa_attn)
     x = torch.randn((2, 3, 224, 224))
     y = model(x)
     print(y.shape)

@@ -1,12 +1,34 @@
+"""
+Minimal Vision Transformer (ViT) implementation in PyTorch.
+- Includes patch embedding, multi-head self-attention, MLP blocks, stochastic depth, and optimizer configuration.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import warnings
 from dataclasses import dataclass
 from einops.layers.torch import Rearrange
 from hydra.utils import instantiate
 
 @dataclass
 class ViTConfig:
+    """Configuration container for Vision Transformer.
+
+    Args:
+        name: Model name.
+        img_size: Input image size (scalar, assumed square img)
+        patch_size: Patch size.
+        img_chls: Number of image channels.
+        n_class: Number of output classes.
+        n_layer: Number of transformer layers.
+        n_heads: Number of attention heads.
+        n_embd: Embedding dimension.
+        mlp_dim: Hidden dimension of MLP (typically 4 x n_embd).
+        drop_rate: Dropout rate.
+        attn_drop_rate: Attention dropout rate.
+        stoch_depth_drop_rate: Stochastic depth rate.
+    """
     name: str = "ViT-B-16"
     img_size: int = 224
     patch_size: int = 16
@@ -25,8 +47,9 @@ class ViTConfig:
         return (self.img_size // self.patch_size) ** 2
 
 class PatchEmbed(nn.Module):
+    """Image to patch embedding module."""
 
-    def __init__(self, img_size, patch_size, in_dim, out_dim, norm_lyr=nn.Identity):
+    def __init__(self, img_size: int, patch_size: int, in_dim: int, out_dim: int, norm_lyr: type[nn.Module] = nn.Identity):
         super().__init__()
         assert img_size % patch_size == 0, f"{patch_size=} must evenly divide {img_size=}"
         self.proj = nn.Conv2d(in_dim, out_dim, kernel_size=patch_size, stride=patch_size, bias=True)
@@ -40,8 +63,9 @@ class PatchEmbed(nn.Module):
         return x
 
 class MLP(nn.Module):
+    """Transformer MLP block."""
 
-    def __init__(self, in_features, hidden_features, out_features, act_fn=nn.GELU, drop_rate=.0):
+    def __init__(self, in_features: int, hidden_features: int, out_features: int, act_fn: type[nn.Module]=nn.GELU, drop_rate: float=.0):
         super().__init__()
         self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_fn()
@@ -57,16 +81,19 @@ class MLP(nn.Module):
         return x
 
 class MultiHeadSelfAttention(nn.Module):
+    """Multi-head self-attention. Uses SDPA with optional fallback"""
 
-    def __init__(self, dim, n_heads, attn_drop_rate=.0, proj_drop_rate=.0, enable_flash_attn=False):
+    def __init__(self, dim: int, n_heads: int, attn_drop_rate: float=.0, proj_drop_rate: float=.0, use_sdpa_attn: bool=True):
         super().__init__()
         assert dim % n_heads == 0
         self.n_heads = n_heads
         head_dim = dim // n_heads
-        self.flash_attn = enable_flash_attn and hasattr(F, 'scaled_dot_product_attention')
+        self.use_sdpa_attn = use_sdpa_attn and hasattr(F, 'scaled_dot_product_attention')
+        if use_sdpa_attn and not self.use_sdpa_attn:
+            warnings.warn("SDPA attn is enabled but not available.")
         self.attn_drop_rate = attn_drop_rate
         self.scale = head_dim ** -0.5
-        if not self.flash_attn:
+        if not self.use_sdpa_attn:
             self.attn_drop = nn.Dropout(attn_drop_rate)
         self.qkv = nn.Linear(dim, dim * 3)
         self.split_qkv = Rearrange("b n (t h d) -> t b h n d", t=3, h=n_heads, d=head_dim)
@@ -76,7 +103,7 @@ class MultiHeadSelfAttention(nn.Module):
 
     def forward(self, x):
         q, k, v = self.split_qkv(self.qkv(x))
-        if self.flash_attn:
+        if self.use_sdpa_attn:
             drop_p = self.attn_drop_rate if self.training else 0.0
             x = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=drop_p)
         else:
@@ -91,10 +118,10 @@ class MultiHeadSelfAttention(nn.Module):
 
 class StochDepthDrop(nn.Module):
     """
-    Stoch. Depth Paper: https://arxiv.org/pdf/1603.09382
-    DeIT uses it: https://arxiv.org/pdf/2012.12877
+    Stoch. Depth, a regularization method used in training residual networks, drops entire residual blocks during training.
+    Paper: https://arxiv.org/pdf/1603.09382
     """
-    def __init__(self, drop_prob):
+    def __init__(self, drop_prob: float):
         super().__init__()
         self.drop_prob = drop_prob
 
@@ -110,10 +137,13 @@ class StochDepthDrop(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, dim, n_heads, mlp_dim, attn_drop_rate, proj_drop_rate, drop_path_prob, enable_flash_attn=True, mlp_drop_rate=None):
+    def __init__(
+            self, dim: int, n_heads: int, mlp_dim: int, attn_drop_rate: float, proj_drop_rate: float,
+            drop_path_prob: float, use_sdpa_attn: bool=True, mlp_drop_rate: float | None = None
+        ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiHeadSelfAttention(dim=dim, n_heads=n_heads, attn_drop_rate=attn_drop_rate, proj_drop_rate=proj_drop_rate, enable_flash_attn=enable_flash_attn)
+        self.attn = MultiHeadSelfAttention(dim=dim, n_heads=n_heads, attn_drop_rate=attn_drop_rate, proj_drop_rate=proj_drop_rate, use_sdpa_attn=use_sdpa_attn)
         self.norm2 = nn.LayerNorm(dim)
         mlp_drop_rate = proj_drop_rate if mlp_drop_rate is None else mlp_drop_rate
         self.mlp = MLP(dim, mlp_dim, dim, drop_rate=mlp_drop_rate)
@@ -127,7 +157,7 @@ class Block(nn.Module):
 
 class ViT(nn.Module):
 
-    def __init__(self, cfg: ViTConfig, enable_flash_attn=False):
+    def __init__(self, cfg:  ViTConfig, use_sdpa_attn: bool=True):
         super().__init__()
         self.cfg = cfg
         L = cfg.n_layer
@@ -140,7 +170,7 @@ class ViT(nn.Module):
                 dim=cfg.n_embd, n_heads=cfg.n_heads, mlp_dim=cfg.mlp_dim,
                 attn_drop_rate=cfg.attn_drop_rate, proj_drop_rate=cfg.drop_rate,
                 drop_path_prob=(l + 1) / L * cfg.stoch_depth_drop_rate,
-                enable_flash_attn=enable_flash_attn,
+                use_sdpa_attn=use_sdpa_attn,
             )
             for l in range(L) # noqa: E741
         )
@@ -188,7 +218,7 @@ class ViT(nn.Module):
     def configure_optimizer(self, optim_cfg, device):
         return _configure_optimizer(self, optim_cfg, device)
 
-def _configure_optimizer(model, optim_cfg, device):
+def _configure_optimizer(model, optim_cfg: object, device: torch.device):
     optim_cfg.fused = getattr(optim_cfg, 'fused', False) and device.type == "cuda"
     params_dict = { pn: p for pn, p in model.named_parameters() }
     params_dict = { pn:p for pn, p in params_dict.items() if p.requires_grad } # filter params that requires grad

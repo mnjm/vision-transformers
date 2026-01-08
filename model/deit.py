@@ -1,3 +1,9 @@
+"""
+Minimal DeiT (Data-efficient Image Transformer) implementation.
+
+Extends ViT with a distillation token
+"""
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -6,12 +12,18 @@ from .vit import ViTConfig, ViT
 
 @dataclass
 class DeitConfig(ViTConfig):
+    """Configuration for DeiT.
+
+    Args:
+        use_dist_token: Enable distillation token.
+    """
     use_dist_token: bool = True
 
 class DeiT(ViT):
+    """DeiT model with distillation token and head."""
 
-    def __init__(self, cfg, enable_flash_attn=True):
-        super().__init__(cfg, enable_flash_attn)
+    def __init__(self, cfg, use_sdpa_attn=True):
+        super().__init__(cfg, use_sdpa_attn)
         assert getattr(cfg, "use_dist_token", False), "DeiT expects use_dist_token=True"
         self.dist_token = nn.Parameter(torch.zeros(1, 1, cfg.n_embd))
         self.head_dist = nn.Linear(cfg.n_embd, cfg.n_class)
@@ -39,6 +51,13 @@ class DeiT(ViT):
         self.teacher = teacher
 
     def loss_fn(self, pred, lbls, imgs=None, weight=.5):
+        """Deit loss.
+         Args:
+            pred: Logits or (cls_logits, dist_logits).
+            lbls: Ground-truth labels.
+            imgs: Input images for teacher.
+            weight: Distillation loss weight.
+        """
         if isinstance(pred, tuple):
             logits_cls, logits_dist = pred
             if self.teacher is None:

@@ -7,16 +7,17 @@ from .swin import SwinTransformer, SwinTransformerConfig
 
 def init_model(cfg, device: torch.device):
     name = cfg.model.name
+    use_sdpa_attn = device.type != "mps"
     if name.startswith("DeiT"):
         assert getattr(cfg.model, 'use_dist_token', False), "Enable use_dist_token in DeiT model config"
         model_cfg = DeitConfig(**cfg.model)
-        model = DeiT(model_cfg)
+        model = DeiT(model_cfg, use_sdpa_attn=use_sdpa_attn)
     elif name.startswith("Swin"):
         model_cfg = SwinTransformerConfig(**cfg.model)
-        model = SwinTransformer(model_cfg, use_flex_attn=device.type!="mps")
+        model = SwinTransformer(model_cfg, use_sdpa_attn=use_sdpa_attn)
     else:
         model_cfg = ViTConfig(**cfg.model)
-        model = ViT(model_cfg, use_flash_attn=device.type != "mps")
+        model = ViT(model_cfg, use_sdpa_attn=use_sdpa_attn)
     return model
 
 def init_deit(model, cfg, device, logger):
